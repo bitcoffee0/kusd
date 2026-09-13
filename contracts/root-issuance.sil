@@ -1,0 +1,168 @@
+pragma silverscript ^0.1.0;
+
+// Root issuance authority. After handover it accepts a MintingModule only when
+// Governance executes the exact active Proposal.
+contract RootIssuance(
+    byte[32] initAssetId, bool initInitialized, int initModuleNonce,
+    int initRemainingAllocation, byte[32] initAuthorityIdentifier,
+    byte initAuthorityType,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash,
+    byte[32] moduleTemplateHash,
+    int governancePrefixLen, int governanceSuffixLen, byte[32] governanceTemplateHash,
+    int proposalPrefixLen, int proposalSuffixLen, byte[32] proposalTemplateHash
+) {
+    byte[32] assetId = initAssetId; bool initialized = initInitialized;
+    int moduleNonce = initModuleNonce; int remainingAllocation = initRemainingAllocation;
+    byte[32] authorityIdentifier = initAuthorityIdentifier; byte authorityType = initAuthorityType;
+
+    struct KCC20State {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct ModuleState {
+        byte[32] assetId; int remainingMint; int maxDebtPerPosition; int minimumCollateralSompi;
+        int liquidationPrice; int expirationDaa; int challengePeriodDaa; int auctionDurationDaa;
+        int challengeRewardPpm; int positionNonce; byte[32] reserveId;
+        int reserveContributionPpm; int riskPremiumPpm;
+    }
+    struct GovernanceState {
+        byte[32] rootId; byte[32] assetId; byte[32] reserveId;
+        int proposalNonce; int executionNonce; byte[32] activeProposalId;
+    }
+    struct ProposalState {
+        pubkey proposer; byte[32] governanceId;
+        int proposalNonce; bool activated;
+        int votingDelayDaa; int executionWindowDaa; int vetoThresholdPpm;
+        int depositSompi; byte[32] assetId; int allocation;
+        int maxDebtPerPosition; int minimumCollateralSompi; int liquidationPrice; int expirationDaa;
+        int challengePeriodDaa; int auctionDurationDaa; int challengeRewardPpm;
+        int reserveContributionPpm; int riskPremiumPpm;
+    }
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    byte constant AUTHORITY_PUBKEY = 0x00;
+    byte constant AUTHORITY_COVENANT_ID = 0x04;
+
+    function requireAuthority(sig authoritySig, ModuleState moduleState,
+        GovernanceState nextGovernance) {
+        if (authorityType == AUTHORITY_PUBKEY) {
+            require(checkSig(authoritySig, pubkey(authorityIdentifier)));
+        } else {
+            require(authorityType == AUTHORITY_COVENANT_ID);
+            require(OpCovInputCount(authorityIdentifier) == 1);
+            int governanceIdx = OpCovInputIdx(authorityIdentifier, 0);
+            GovernanceState oldGovernance = readInputStateWithTemplate(governanceIdx,
+                governancePrefixLen, governanceSuffixLen, governanceTemplateHash);
+            require(oldGovernance.activeProposalId !=
+                byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+            require(OpCovInputCount(oldGovernance.activeProposalId) == 1);
+            int proposalIdx = OpCovInputIdx(oldGovernance.activeProposalId, 0);
+            ProposalState authenticated = readInputStateWithTemplate(proposalIdx,
+                proposalPrefixLen, proposalSuffixLen, proposalTemplateHash);
+            require(authenticated.activated);
+            require(authenticated.governanceId == authorityIdentifier);
+            require(authenticated.assetId == moduleState.assetId);
+            require(authenticated.allocation == moduleState.remainingMint);
+            require(authenticated.maxDebtPerPosition == moduleState.maxDebtPerPosition);
+            require(authenticated.minimumCollateralSompi == moduleState.minimumCollateralSompi);
+            require(authenticated.liquidationPrice == moduleState.liquidationPrice);
+            require(authenticated.expirationDaa == moduleState.expirationDaa);
+            require(authenticated.challengePeriodDaa == moduleState.challengePeriodDaa);
+            require(authenticated.auctionDurationDaa == moduleState.auctionDurationDaa);
+            require(authenticated.challengeRewardPpm == moduleState.challengeRewardPpm);
+            require(authenticated.reserveContributionPpm == moduleState.reserveContributionPpm);
+            require(authenticated.riskPremiumPpm == moduleState.riskPremiumPpm);
+            int governanceOut = OpCovOutputIdx(authorityIdentifier, 0);
+            validateOutputStateWithInputTemplate(governanceOut, nextGovernance,
+                governanceIdx, governancePrefixLen, governanceSuffixLen, governanceTemplateHash);
+            require(nextGovernance.rootId == oldGovernance.rootId);
+            require(nextGovernance.assetId == oldGovernance.assetId);
+            require(nextGovernance.reserveId == oldGovernance.reserveId);
+            require(nextGovernance.proposalNonce == oldGovernance.proposalNonce);
+            require(nextGovernance.executionNonce == oldGovernance.executionNonce + 1);
+            require(nextGovernance.activeProposalId ==
+                byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        }
+    }
+
+    #[covenant.singleton(name = init)]
+    function initPolicy(State prevState, State nextState) {
+        require(!prevState.initialized && nextState.initialized);
+        require(nextState.assetId == OpOutputCovenantId(0));
+        require(nextState.moduleNonce == 0 && nextState.remainingAllocation > 0);
+        require(nextState.authorityType == AUTHORITY_PUBKEY);
+    }
+
+    #[covenant.singleton(name = create_module)]
+    function createModulePolicy(
+        State prevState, State nextState, sig authoritySig,
+        byte moduleOutputIndex, byte[] modulePrefix, byte[] moduleSuffix,
+        ModuleState moduleState, GovernanceState nextGovernance,
+        KCC20State rootMinterState, KCC20State moduleMinterState
+    ) {
+        requireAuthority(authoritySig, moduleState, nextGovernance);
+        require(prevState.initialized && nextState.initialized);
+        require(nextState.assetId == prevState.assetId);
+        require(nextState.moduleNonce == prevState.moduleNonce + 1);
+        require(nextState.remainingAllocation == prevState.remainingAllocation - moduleState.remainingMint);
+        require(nextState.remainingAllocation >= 0);
+        require(nextState.authorityIdentifier == prevState.authorityIdentifier);
+        require(nextState.authorityType == prevState.authorityType);
+        require(moduleState.assetId == prevState.assetId && moduleState.remainingMint > 0);
+        require(moduleState.maxDebtPerPosition > 0);
+        require(moduleState.minimumCollateralSompi > 0);
+        require(moduleState.maxDebtPerPosition <= moduleState.remainingMint);
+        require(moduleState.liquidationPrice > 0 && moduleState.expirationDaa > 0);
+        require(moduleState.challengePeriodDaa > 0);
+        require(moduleState.auctionDurationDaa > 0);
+        require(moduleState.challengeRewardPpm > 0 && moduleState.challengeRewardPpm <= 100000);
+        require(moduleState.positionNonce == 0);
+        require(moduleState.reserveContributionPpm >= 0 && moduleState.reserveContributionPpm < 1000000);
+        require(moduleState.riskPremiumPpm >= 0 && moduleState.riskPremiumPpm <= 1000000);
+
+        int moduleIdx = unsigned(moduleOutputIndex); require(moduleIdx < tx.outputs.length);
+        require(templateHash(modulePrefix, moduleSuffix) == moduleTemplateHash);
+        validateOutputStateWithTemplate(moduleIdx, moduleState, modulePrefix,
+            moduleSuffix, moduleTemplateHash);
+        byte[32] moduleId = OpOutputCovenantId(moduleIdx);
+        if (authorityType == AUTHORITY_PUBKEY) {
+            require(OpCovInputCount(prevState.assetId) == 1);
+            require(OpCovOutputCount(prevState.assetId) == 2);
+        } else {
+            // Governed execution also returns the Proposal's escrowed KUSD
+            // fee. Proposal and KCC20 independently authenticate that third
+            // output and preserve its amount.
+            require(authorityType == AUTHORITY_COVENANT_ID);
+            require(OpCovInputCount(prevState.assetId) == 2);
+            require(OpCovOutputCount(prevState.assetId) == 3);
+        }
+        int tokenIdx = OpCovInputIdx(prevState.assetId, 0);
+        KCC20State oldRoot = readInputStateWithTemplate(tokenIdx,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        byte[32] rootId = OpInputCovenantId(this.activeInputIndex);
+        require(oldRoot.ownerIdentifier == rootId && oldRoot.identifierType == IDENTIFIER_COVENANT_ID);
+        require(oldRoot.amount == 0 && oldRoot.isMinter);
+        require(rootMinterState.ownerIdentifier == rootId);
+        require(rootMinterState.identifierType == IDENTIFIER_COVENANT_ID);
+        require(rootMinterState.amount == 0 && rootMinterState.isMinter);
+        require(moduleMinterState.ownerIdentifier == moduleId);
+        require(moduleMinterState.identifierType == IDENTIFIER_COVENANT_ID);
+        require(moduleMinterState.amount == 0 && moduleMinterState.isMinter);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 0),
+            rootMinterState, tokenIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 1),
+            moduleMinterState, tokenIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+    }
+
+    #[covenant.singleton(name = handover)]
+    function handoverPolicy(State prevState, State nextState, sig authoritySig,
+        byte[32] nextAuthorityIdentifier, byte nextAuthorityType) {
+        require(authorityType == AUTHORITY_PUBKEY);
+        require(checkSig(authoritySig, pubkey(authorityIdentifier)));
+        require(prevState.initialized && nextState.initialized);
+        require(nextState.assetId == prevState.assetId);
+        require(nextState.moduleNonce == prevState.moduleNonce);
+        require(nextState.remainingAllocation == prevState.remainingAllocation);
+        require(nextState.authorityIdentifier == nextAuthorityIdentifier);
+        require(nextState.authorityType == nextAuthorityType);
+        require(nextAuthorityType == AUTHORITY_PUBKEY || nextAuthorityType == AUTHORITY_COVENANT_ID);
+    }
+}

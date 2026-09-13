@@ -1,0 +1,114 @@
+pragma silverscript ^0.1.0;
+
+// KPS voting lock. The economic owner can recover the shares; the delegate may
+// only use them for veto. Weight accrues in DAA steps up to maxVoteWeight.
+contract KpsDelegation(
+    pubkey initOwner, pubkey initDelegate, byte[32] initKpsId,
+    int initAmount, int initWeight,
+    int weightEpochDaa, int maxVoteWeight
+) {
+    pubkey owner = initOwner;
+    pubkey delegate = initDelegate;
+    byte[32] kpsId = initKpsId;
+    int amount = initAmount;
+    int weight = initWeight;
+
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+
+    function requireConfig() {
+        require(amount > 0 && weight >= 0 && weight <= maxVoteWeight);
+        require(weightEpochDaa > 0 && maxVoteWeight > 0 && maxVoteWeight <= 16);
+    }
+
+    function requireLockedKps(
+        byte kpsInputIndex, TokenState returnedKps, byte kpsOutputIndex,
+        bool unlock
+    ) {
+        int inputIdx = unsigned(kpsInputIndex);
+        int outputIdx = unsigned(kpsOutputIndex);
+        require(inputIdx < tx.inputs.length && outputIdx < tx.outputs.length);
+        require(OpInputCovenantId(inputIdx) == kpsId);
+        require(returnedKps.amount == amount && !returnedKps.isMinter);
+        if (unlock) {
+            require(returnedKps.identifierType == IDENTIFIER_PUBKEY);
+            require(returnedKps.ownerIdentifier == byte[32](owner));
+        } else {
+            require(returnedKps.identifierType == IDENTIFIER_COVENANT_ID);
+            require(returnedKps.ownerIdentifier == OpInputCovenantId(this.activeInputIndex));
+        }
+        require(tx.outputs[outputIdx].value == tx.inputs[inputIdx].value);
+        require(OpOutputCovenantId(outputIdx) == kpsId);
+        if (!unlock) {
+            require(tx.outputs[outputIdx].scriptPubKey == tx.inputs[inputIdx].scriptPubKey);
+        }
+    }
+
+    function requireSuccessor(State nextState) {
+        require(nextState.owner == owner && nextState.delegate == delegate);
+        require(nextState.kpsId == kpsId && nextState.amount == amount);
+        require(nextState.weight == weight);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = mature)]
+    function maturePolicy(
+        State prevState, State nextState,
+        TokenState returnedKps, byte kpsInputIndex, byte kpsOutputIndex
+    ) {
+        requireConfig();
+        require(prevState.weight < maxVoteWeight);
+        require(this.ageDaa >= weightEpochDaa);
+        require(nextState.owner == prevState.owner && nextState.delegate == prevState.delegate);
+        require(nextState.kpsId == prevState.kpsId && nextState.amount == prevState.amount);
+        require(nextState.weight == prevState.weight + 1);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+        requireLockedKps(kpsInputIndex, returnedKps, kpsOutputIndex, false);
+    }
+
+    #[covenant.singleton(name = redelegate)]
+    function redelegatePolicy(
+        State prevState, State nextState, sig ownerSig,
+        TokenState returnedKps, byte kpsInputIndex, byte kpsOutputIndex
+    ) {
+        requireConfig();
+        require(checkSig(ownerSig, prevState.owner));
+        require(nextState.owner == prevState.owner && nextState.delegate != prevState.delegate);
+        require(nextState.kpsId == prevState.kpsId && nextState.amount == prevState.amount);
+        require(nextState.weight == prevState.weight);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+        requireLockedKps(kpsInputIndex, returnedKps, kpsOutputIndex, false);
+    }
+
+    // Voting preserves the lock and its exact weight. ModuleProposal computes
+    // the weighted total independently from the same inputs.
+    #[covenant.allow(rule = manual_entrypoint_in_leader_contract)]
+    entry vetoPolicy(
+        sig delegateSig, byte[32] proposalId, State nextState,
+        TokenState returnedKps, byte kpsInputIndex, byte kpsOutputIndex
+    ) {
+        requireConfig();
+        require(weight > 0 && OpCovInputCount(proposalId) == 1);
+        require(checkSig(delegateSig, delegate));
+        requireSuccessor(nextState);
+        requireLockedKps(kpsInputIndex, returnedKps, kpsOutputIndex, false);
+    }
+
+    // Voluntary exit: only the owner receives KPS, never the delegate.
+    entry unlockPolicy(
+        sig ownerSig, TokenState returnedKps,
+        byte kpsInputIndex, byte kpsOutputIndex
+    ) {
+        requireConfig();
+        require(checkSig(ownerSig, owner));
+        require(OpCovOutputCount(OpInputCovenantId(this.activeInputIndex)) == 0);
+        requireLockedKps(kpsInputIndex, returnedKps, kpsOutputIndex, true);
+    }
+}

@@ -1,0 +1,45 @@
+pragma silverscript ^0.1.0;
+
+contract ChallengeAnchor(
+    pubkey initOwner, pubkey initChallenger, byte[32] initPositionId, byte[32] initAssetId,
+    int initDebt, int initAssignedReserve, byte[32] initReserveId,
+    int initLiquidationPrice, int initRewardPpm, int initChallengePeriodDaa,
+    int initAuctionDurationDaa,
+    int initCollateralSompi, int initKccPrefixLen, int initKccSuffixLen,
+    byte[32] initKccTemplateHash, byte[] challengeTemplatePrefix,
+    byte[] challengeTemplateSuffix, byte[32] challengeTemplateHash
+) {
+    pubkey owner = initOwner; pubkey challenger = initChallenger; byte[32] positionId = initPositionId;
+    byte[32] assetId = initAssetId; int debt = initDebt;
+    int assignedReserve = initAssignedReserve; byte[32] reserveId = initReserveId;
+    int liquidationPrice = initLiquidationPrice; int rewardPpm = initRewardPpm;
+    int challengePeriodDaa = initChallengePeriodDaa;
+    int auctionDurationDaa = initAuctionDurationDaa; int collateralSompi = initCollateralSompi;
+    int kccPrefixLen = initKccPrefixLen; int kccSuffixLen = initKccSuffixLen;
+    byte[32] kccTemplateHash = initKccTemplateHash;
+    struct ChallengeState {
+        pubkey owner; pubkey challenger; byte[32] positionId; byte[32] assetId; int debt;
+        int assignedReserve; byte[32] reserveId; int liquidationPrice;
+        int rewardPpm; int challengePeriodDaa; int auctionDurationDaa; int collateralSompi;
+        int kccPrefixLen; int kccSuffixLen; byte[32] kccTemplateHash;
+    }
+
+    entry initPolicy(byte challengeOutputIndex, ChallengeState s) {
+        byte[32] anchorId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(anchorId) == 1 && OpCovOutputCount(anchorId) == 1);
+        require(s.owner == owner && s.challenger == challenger);
+        require(s.positionId == positionId && s.assetId == assetId);
+        require(s.debt == debt && s.assignedReserve == assignedReserve && s.reserveId == reserveId);
+        require(s.liquidationPrice == liquidationPrice && s.rewardPpm == rewardPpm);
+        require(s.challengePeriodDaa == challengePeriodDaa && s.collateralSompi == collateralSompi);
+        require(s.auctionDurationDaa == auctionDurationDaa);
+        require(s.kccPrefixLen == kccPrefixLen && s.kccSuffixLen == kccSuffixLen);
+        require(s.kccTemplateHash == kccTemplateHash);
+        int outIdx = unsigned(challengeOutputIndex);
+        require(outIdx < tx.outputs.length && outIdx == OpCovOutputIdx(anchorId, 0));
+        require(tx.outputs[outIdx].value == tx.inputs[this.activeInputIndex].value);
+        validateOutputStateWithTemplate(outIdx, s, challengeTemplatePrefix,
+            challengeTemplateSuffix, challengeTemplateHash);
+        require(OpOutputCovenantId(outIdx) == anchorId);
+    }
+}

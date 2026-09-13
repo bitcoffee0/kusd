@@ -1,0 +1,135 @@
+pragma silverscript ^0.1.0;
+
+// KCC20-compatible Reserve share. Delegated spending of a non-minter share,
+// including redemption, requires the UTXO to reach the minimum DAA age. A
+// transfer creates a new UTXO and therefore resets its age.
+contract KPS(
+    byte[32] genesisPk,
+    int genesisAmount,
+    byte genesisIdentifierType,
+    bool genesisIsMinter,
+    int maxCovIns,
+    int maxCovOuts,
+    int minimumHoldingDaa,
+    byte[] delegationTemplatePrefix, byte[] delegationTemplateSuffix,
+    byte[32] delegationTemplateHash
+) {
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_SCRIPT_HASH = 0x01;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    byte[32] ownerIdentifier = genesisPk;
+    byte identifierType = genesisIdentifierType;
+    int amount = genesisAmount;
+    bool isMinter = genesisIsMinter;
+
+    struct DelegationState {
+        pubkey owner; pubkey delegate; byte[32] kpsId;
+        int amount; int weight;
+    }
+
+    function checkInputSig(sig s, byte witness) {
+        if (identifierType == IDENTIFIER_PUBKEY) {
+            require(checkSig(s, pubkey(ownerIdentifier)));
+        } else if (identifierType == IDENTIFIER_SCRIPT_HASH) {
+            byte[] spk = byte[](new ScriptPubKeyP2SH(ownerIdentifier));
+            require(tx.inputs[unsigned(witness)].scriptPubKey == spk);
+        } else if (identifierType == IDENTIFIER_COVENANT_ID) {
+            require(OpCovInputCount(ownerIdentifier) > 0);
+        } else {
+            require(false);
+        }
+    }
+
+    function checkAmounts(State[] prevStates, State[] newStates) {
+        if (!isMinter) {
+            int totalIn = 0;
+            for(i, 0, prevStates.length, maxCovIns) {
+                totalIn = totalIn + prevStates[i].amount;
+            }
+            int totalOut = 0;
+            for(i, 0, newStates.length, maxCovOuts) {
+                totalOut = totalOut + newStates[i].amount;
+            }
+            require(totalIn == totalOut);
+        }
+    }
+
+    function checkMintingTransfer(State[] newStates) {
+        if (!isMinter) {
+            for(i, 0, newStates.length, maxCovOuts) {
+                require(!newStates[i].isMinter);
+                // A covenant-owned output can only be created through
+                // lockDelegationPolicy, qui authentifie un poids initial nul.
+                if (identifierType == IDENTIFIER_COVENANT_ID) {
+                    require(newStates[i].identifierType == IDENTIFIER_COVENANT_ID);
+                    require(newStates[i].ownerIdentifier == ownerIdentifier);
+                } else {
+                    require(newStates[i].identifierType != IDENTIFIER_COVENANT_ID);
+                }
+            }
+        }
+    }
+
+    #[covenant(binding = cov, from = maxCovIns, to = maxCovOuts, name = transfer, delegate_name = transfer_delegator)]
+    function transferPolicy(State[] prevStates, State[] newStates, sig s, byte witness) {
+        checkInputSig(s, witness);
+        checkAmounts(prevStates, newStates);
+        checkMintingTransfer(newStates);
+    }
+
+    #[covenant.delegate]
+    function authorizeDelegate(sig s, byte witness) {
+        checkInputSig(s, witness);
+        if (!isMinter) {
+            require(minimumHoldingDaa > 0);
+            require(this.ageDaa >= minimumHoldingDaa);
+        }
+    }
+
+    #[covenant.allow(rule = manual_entrypoint_in_leader_contract)]
+    entry lockDelegationPolicy(
+        sig ownerSig, byte witness, DelegationState delegation,
+        State lockedOutput, byte delegationOutputIndex, byte kpsOutputIndex
+    ) {
+        require(!isMinter && amount > 0 && identifierType == IDENTIFIER_PUBKEY);
+        checkInputSig(ownerSig, witness);
+        byte[32] kpsId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(kpsId) == 1 && OpCovOutputCount(kpsId) == 1);
+        require(byte[32](delegation.owner) == ownerIdentifier);
+        require(delegation.kpsId == kpsId && delegation.amount == amount);
+        require(delegation.weight == 0);
+        int delegationOut = unsigned(delegationOutputIndex);
+        validateOutputStateWithTemplate(delegationOut, delegation,
+            delegationTemplatePrefix, delegationTemplateSuffix, delegationTemplateHash);
+        byte[32] delegationId = OpOutputCovenantId(delegationOut);
+        require(lockedOutput.ownerIdentifier == delegationId);
+        require(lockedOutput.identifierType == IDENTIFIER_COVENANT_ID);
+        require(lockedOutput.amount == amount && !lockedOutput.isMinter);
+        int kpsOut = unsigned(kpsOutputIndex);
+        require(kpsOut == OpCovOutputIdx(kpsId, 0));
+        validateOutputState(kpsOut, lockedOutput);
+    }
+
+    // The authenticated lock owns this UTXO. Its owner signs unlockPolicy;
+    // KPS enforces the beneficiary and exact successor state here.
+    #[covenant.allow(rule = manual_entrypoint_in_leader_contract)]
+    entry unlockDelegationPolicy(
+        DelegationState delegation, State returnedKps,
+        byte delegationInputIndex, byte kpsOutputIndex
+    ) {
+        require(!isMinter && amount > 0 && identifierType == IDENTIFIER_COVENANT_ID);
+        int delegationIdx = unsigned(delegationInputIndex);
+        require(delegationIdx < tx.inputs.length);
+        require(OpInputCovenantId(delegationIdx) == ownerIdentifier);
+        require(OpCovInputCount(ownerIdentifier) == 1);
+        require(delegation.kpsId == OpInputCovenantId(this.activeInputIndex));
+        require(delegation.amount == amount);
+        require(returnedKps.ownerIdentifier == byte[32](delegation.owner));
+        require(returnedKps.identifierType == IDENTIFIER_PUBKEY);
+        require(returnedKps.amount == amount && !returnedKps.isMinter);
+        int kpsOut = unsigned(kpsOutputIndex);
+        require(kpsOut == OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0));
+        validateOutputState(kpsOut, returnedKps);
+    }
+
+}

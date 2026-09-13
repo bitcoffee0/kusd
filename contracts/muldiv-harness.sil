@@ -1,0 +1,64 @@
+pragma silverscript ^0.1.0;
+
+// Arithmetic harness. Binary long division never materializes a*b in a signed
+// integer.
+contract MulDivHarness(int initA, int initB, int initDenominator, int initExpected) {
+    int a = initA;
+    int b = initB;
+    int denominator = initDenominator;
+    int expected = initExpected;
+    int constant MAX_INT = 9223372036854775807;
+    int constant TOP_BIT = 4611686018427387904;
+
+    function mulDivFloor(int x, int y, int d) : int {
+        require(x >= 0 && y >= 0 && d > 0);
+        int result = 0;
+        if (x == 0 || y == 0) {
+            result = 0;
+        } else if (x == d) {
+            result = y;
+        } else if (y == d) {
+            result = x;
+        } else if (x <= MAX_INT / y) {
+            result = x * y / d;
+        } else {
+            int yQuotient = y / d;
+            int yRemainder = y % d;
+            int quotient = 0;
+            int remainder = 0;
+            int bitValue = TOP_BIT;
+
+            for(i, 0, 63, 63) {
+                quotient = quotient * 2;
+                int carry = 0;
+
+                // remainder = (2 * remainder) % d without overflow.
+                if (remainder >= d - remainder) {
+                    remainder = remainder - (d - remainder);
+                    carry = 1;
+                } else {
+                    remainder = remainder * 2;
+                }
+
+                if ((x / bitValue) % 2 == 1) {
+                    quotient = quotient + yQuotient;
+                    if (remainder >= d - yRemainder) {
+                        remainder = remainder - (d - yRemainder);
+                        carry = carry + 1;
+                    } else {
+                        remainder = remainder + yRemainder;
+                    }
+                }
+
+                quotient = quotient + carry;
+                bitValue = bitValue / 2;
+            }
+            result = quotient;
+        }
+        return(result);
+    }
+
+    entry verify() {
+        require(mulDivFloor(a, b, denominator) == expected);
+    }
+}

@@ -1,0 +1,152 @@
+pragma silverscript ^0.1.0;
+
+// Serialized veto-based governance. Only one proposal may be active, allowing
+// its provenance to be authenticated without a global registry or assumed ID.
+contract Governance(
+    byte[32] initRootId, byte[32] initAssetId, byte[32] initKpsId, byte[32] initReserveId,
+    int initProposalNonce, int initExecutionNonce, byte[32] initActiveProposalId,
+    int initVotingDelayDaa, int initExecutionWindowDaa,
+    int initVetoThresholdPpm, int initProposalDepositSompi,
+    int initProposalFeeKusd,
+    int initMinModuleAllocation, int initMaxModuleAllocation,
+    int initMaxDebtPerPosition, int initMinCollateralSompi, int initMaxCollateralSompi,
+    int initMinModuleDurationDaa, int initMaxModuleDurationDaa,
+    int initMinChallengePeriodDaa, int initMaxChallengePeriodDaa,
+    int initMinAuctionDurationDaa, int initMaxAuctionDurationDaa,
+    int initMaxRiskPremiumPpm, int initMinReserveContributionPpm,
+    int initMaxReserveContributionPpm,
+    byte[] proposalTemplatePrefix, byte[] proposalTemplateSuffix,
+    byte[32] proposalTemplateHash,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash
+) {
+    byte[32] rootId = initRootId; byte[32] assetId = initAssetId;
+    byte[32] reserveId = initReserveId;
+    // Only mutable values and identifiers involved in the bootstrap cycle are
+    // serialized. All policy limits above are immutable template arguments.
+    int proposalNonce = initProposalNonce;
+    int executionNonce = initExecutionNonce; byte[32] activeProposalId = initActiveProposalId;
+    byte[32] constant ZERO = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+    struct ProposalState {
+        pubkey proposer; byte[32] governanceId;
+        int proposalNonce; bool activated;
+        int votingDelayDaa; int executionWindowDaa; int vetoThresholdPpm;
+        int depositSompi; byte[32] assetId; int allocation;
+        int maxDebtPerPosition; int minimumCollateralSompi; int liquidationPrice;
+        int expirationDaa; int challengePeriodDaa; int auctionDurationDaa;
+        int challengeRewardPpm;
+        int reserveContributionPpm; int riskPremiumPpm;
+    }
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct ReserveState {
+        byte[32] kusdAssetId; byte[32] kpsAssetId; int reserveKusd;
+        int totalKps; int collateralSompi; int auctionPrefixLenState;
+        int auctionSuffixLenState; byte[32] auctionTemplateHashState;
+    }
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+
+    function requireIdentity(State a, State b) {
+        require(b.rootId == a.rootId && b.assetId == a.assetId);
+        require(b.reserveId == a.reserveId);
+    }
+
+    function requireActiveProposalInput(State prevState) {
+        require(prevState.activeProposalId != ZERO);
+        require(OpCovInputCount(prevState.activeProposalId) == 1);
+    }
+
+    #[covenant.singleton(name = propose_module)]
+    function proposeModulePolicy(State prevState, State nextState,
+        byte proposalOutputIndex, ProposalState proposal, TokenState feeEscrow) {
+        require(prevState.activeProposalId == ZERO); requireIdentity(prevState, nextState);
+        require(nextState.proposalNonce == prevState.proposalNonce + 1);
+        require(nextState.executionNonce == prevState.executionNonce);
+        require(proposal.proposalNonce == nextState.proposalNonce);
+        require(!proposal.activated);
+        require(proposal.governanceId == OpInputCovenantId(this.activeInputIndex));
+        require(proposal.assetId == prevState.assetId);
+        require(proposal.votingDelayDaa == initVotingDelayDaa);
+        require(proposal.executionWindowDaa == initExecutionWindowDaa);
+        require(proposal.vetoThresholdPpm == initVetoThresholdPpm);
+        require(proposal.depositSompi == initProposalDepositSompi);
+        require(proposal.allocation >= initMinModuleAllocation);
+        require(proposal.allocation <= initMaxModuleAllocation);
+        require(proposal.maxDebtPerPosition > 0);
+        require(proposal.maxDebtPerPosition <= initMaxDebtPerPosition);
+        require(proposal.maxDebtPerPosition <= proposal.allocation);
+        require(proposal.minimumCollateralSompi >= initMinCollateralSompi);
+        require(proposal.minimumCollateralSompi <= initMaxCollateralSompi);
+        require(proposal.liquidationPrice > 0);
+        require(OpTxLockTime() >= OpTxInputDaaScore(this.activeInputIndex));
+        require(proposal.expirationDaa >= OpTxLockTime() + initMinModuleDurationDaa);
+        require(proposal.expirationDaa <= OpTxLockTime() + initMaxModuleDurationDaa);
+        require(proposal.challengePeriodDaa >= initMinChallengePeriodDaa);
+        require(proposal.challengePeriodDaa <= initMaxChallengePeriodDaa);
+        require(proposal.auctionDurationDaa >= initMinAuctionDurationDaa);
+        require(proposal.auctionDurationDaa <= initMaxAuctionDurationDaa);
+        require(proposal.challengeRewardPpm > 0 && proposal.challengeRewardPpm <= 100000);
+        require(proposal.reserveContributionPpm >= initMinReserveContributionPpm);
+        require(proposal.reserveContributionPpm <= initMaxReserveContributionPpm);
+        require(proposal.riskPremiumPpm >= 0);
+        require(proposal.riskPremiumPpm <= initMaxRiskPremiumPpm);
+        require(proposal.reserveContributionPpm < 1000000);
+        int idx = unsigned(proposalOutputIndex); require(idx < tx.outputs.length);
+        validateOutputStateWithTemplate(idx, proposal, proposalTemplatePrefix,
+            proposalTemplateSuffix, proposalTemplateHash);
+        require(tx.outputs[idx].value == initProposalDepositSompi);
+        require(nextState.activeProposalId == OpOutputCovenantId(idx));
+
+        require(initProposalFeeKusd > 0);
+        require(OpCovInputCount(prevState.assetId) == 1);
+        require(OpCovOutputCount(prevState.assetId) == 1);
+        int feeInput = OpCovInputIdx(prevState.assetId, 0);
+        TokenState feeToken = readInputStateWithTemplate(feeInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        require(feeToken.ownerIdentifier == byte[32](proposal.proposer));
+        require(feeToken.identifierType == IDENTIFIER_PUBKEY);
+        require(feeToken.amount == initProposalFeeKusd && !feeToken.isMinter);
+        require(feeEscrow.ownerIdentifier == nextState.activeProposalId);
+        require(feeEscrow.identifierType == IDENTIFIER_COVENANT_ID);
+        require(feeEscrow.amount == initProposalFeeKusd && !feeEscrow.isMinter);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 0),
+            feeEscrow, feeInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = execute_module)]
+    function executeModulePolicy(State prevState, State nextState) {
+        requireIdentity(prevState, nextState); requireActiveProposalInput(prevState);
+        require(OpCovInputCount(prevState.rootId) == 1);
+        require(nextState.activeProposalId == ZERO);
+        require(nextState.proposalNonce == prevState.proposalNonce);
+        require(nextState.executionNonce == prevState.executionNonce + 1);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = veto_module)]
+    function vetoModulePolicy(State prevState, State nextState) {
+        requireIdentity(prevState, nextState); requireActiveProposalInput(prevState);
+        require(OpCovInputCount(prevState.reserveId) == 1);
+        require(OpCovOutputCount(prevState.reserveId) == 1);
+        require(nextState.activeProposalId == ZERO);
+        require(nextState.proposalNonce == prevState.proposalNonce);
+        require(nextState.executionNonce == prevState.executionNonce);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = cancel_expired)]
+    function cancelExpiredPolicy(State prevState, State nextState) {
+        requireIdentity(prevState, nextState); requireActiveProposalInput(prevState);
+        require(nextState.activeProposalId == ZERO);
+        require(nextState.proposalNonce == prevState.proposalNonce);
+        require(nextState.executionNonce == prevState.executionNonce);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+}

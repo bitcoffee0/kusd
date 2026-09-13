@@ -1,0 +1,237 @@
+pragma silverscript ^0.1.0;
+
+// Serialized MintingModule proposal. Governance creates its UTXO, after which
+// it can be executed, vetoed, or expired exactly once. Veto aggregates
+// delegation locks and their KPS atomically.
+contract ModuleProposal(
+    pubkey initProposer,
+    byte[32] initGovernanceId, byte[32] initRootId,
+    byte[32] initKpsId, byte[32] initReserveId,
+    int initProposalNonce, bool initActivated, int initVotingDelayDaa,
+    int initExecutionWindowDaa, int initVetoThresholdPpm,
+    int initDepositSompi,
+    byte[32] initAssetId, int initAllocation,
+    int initMaxDebtPerPosition, int initMinimumCollateralSompi,
+    int initLiquidationPrice, int initExpirationDaa, int initChallengePeriodDaa,
+    int initAuctionDurationDaa,
+    int initChallengeRewardPpm,
+    int initReserveContributionPpm, int initRiskPremiumPpm,
+    int initProposalFeeKusd,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash,
+    int kpsPrefixLen, int kpsSuffixLen, byte[32] kpsTemplateHash,
+    int delegationPrefixLen, int delegationSuffixLen, byte[32] delegationTemplateHash,
+    int maxVoteWeight,
+    int reservePrefixLen, int reserveSuffixLen, byte[32] reserveTemplateHash
+) {
+    pubkey proposer = initProposer;
+    byte[32] governanceId = initGovernanceId;
+    int proposalNonce = initProposalNonce; bool activated = initActivated;
+    int votingDelayDaa = initVotingDelayDaa;
+    int executionWindowDaa = initExecutionWindowDaa;
+    int vetoThresholdPpm = initVetoThresholdPpm; int depositSompi = initDepositSompi;
+    byte[32] assetId = initAssetId; int allocation = initAllocation;
+    int maxDebtPerPosition = initMaxDebtPerPosition;
+    int minimumCollateralSompi = initMinimumCollateralSompi;
+    int liquidationPrice = initLiquidationPrice; int expirationDaa = initExpirationDaa;
+    int challengePeriodDaa = initChallengePeriodDaa;
+    int auctionDurationDaa = initAuctionDurationDaa;
+    int challengeRewardPpm = initChallengeRewardPpm;
+    int reserveContributionPpm = initReserveContributionPpm;
+    int riskPremiumPpm = initRiskPremiumPpm;
+
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct ReserveState {
+        byte[32] kusdAssetId; byte[32] kpsAssetId; int reserveKusd;
+        int totalKps; int collateralSompi; int auctionPrefixLenState;
+        int auctionSuffixLenState; byte[32] auctionTemplateHashState;
+    }
+    struct DelegationState {
+        pubkey owner; pubkey delegate; byte[32] kpsId;
+        int amount; int weight;
+    }
+    int constant PPM = 1000000;
+    int constant MAX_INT = 9223372036854775807;
+
+    function requireIdentity(State a, State b) {
+        require(b.proposer == a.proposer && b.governanceId == a.governanceId);
+        require(b.proposalNonce == a.proposalNonce);
+        require(b.votingDelayDaa == a.votingDelayDaa);
+        require(b.executionWindowDaa == a.executionWindowDaa);
+        require(b.vetoThresholdPpm == a.vetoThresholdPpm && b.depositSompi == a.depositSompi);
+        require(b.assetId == a.assetId && b.allocation == a.allocation);
+        require(b.maxDebtPerPosition == a.maxDebtPerPosition);
+        require(b.minimumCollateralSompi == a.minimumCollateralSompi);
+        require(b.liquidationPrice == a.liquidationPrice && b.expirationDaa == a.expirationDaa);
+        require(b.challengePeriodDaa == a.challengePeriodDaa);
+        require(b.auctionDurationDaa == a.auctionDurationDaa);
+        require(b.challengeRewardPpm == a.challengeRewardPpm);
+        require(b.reserveContributionPpm == a.reserveContributionPpm);
+        require(b.riskPremiumPpm == a.riskPremiumPpm);
+    }
+
+    function requireGovernanceAndTermination() {
+        require(OpCovInputCount(governanceId) == 1);
+        byte[32] proposalId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(proposalId) == 1 && OpCovOutputCount(proposalId) == 0);
+    }
+
+    function requireRefund(byte refundOutputIndex) {
+        int idx = unsigned(refundOutputIndex);
+        require(idx < tx.outputs.length);
+        require(tx.outputs[idx].scriptPubKey == byte[](new ScriptPubKeyP2PK(proposer)));
+        require(tx.outputs[idx].value == depositSompi);
+        require(tx.inputs[this.activeInputIndex].value == depositSompi);
+    }
+
+    function requireFeeRefund(TokenState feeRefund, byte feeInputIndex, byte feeOutputIndex) {
+        byte[32] proposalId = OpInputCovenantId(this.activeInputIndex);
+        require(initProposalFeeKusd > 0);
+        int feeInput = unsigned(feeInputIndex);
+        int feeOutput = unsigned(feeOutputIndex);
+        require(feeInput < tx.inputs.length && feeOutput < tx.outputs.length);
+        require(OpInputCovenantId(feeInput) == assetId);
+        require(OpOutputCovenantId(feeOutput) == assetId);
+        TokenState fee = readInputStateWithTemplate(feeInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        require(fee.ownerIdentifier == proposalId && fee.identifierType == 0x02);
+        require(fee.amount == initProposalFeeKusd && !fee.isMinter);
+        require(feeRefund.ownerIdentifier == byte[32](proposer));
+        require(feeRefund.identifierType == 0x00);
+        require(feeRefund.amount == initProposalFeeKusd && !feeRefund.isMinter);
+        validateOutputStateWithInputTemplate(feeOutput, feeRefund,
+            feeInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+    }
+
+    #[covenant.singleton(name = activate)]
+    function activatePolicy(State prevState, State nextState) {
+        require(!prevState.activated && nextState.activated);
+        require(this.ageDaa >= prevState.votingDelayDaa);
+        requireIdentity(prevState, nextState);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    entry executePolicy(byte refundOutputIndex, TokenState feeRefund,
+        byte feeInputIndex, byte feeOutputIndex) {
+        requireGovernanceAndTermination();
+        require(activated);
+        requireRefund(refundOutputIndex);
+        requireFeeRefund(feeRefund, feeInputIndex, feeOutputIndex);
+    }
+
+    entry cancelExpiredPolicy(byte refundOutputIndex, TokenState feeRefund,
+        byte feeInputIndex, byte feeOutputIndex) {
+        requireGovernanceAndTermination();
+        require(activated);
+        require(this.ageDaa >= executionWindowDaa);
+        requireRefund(refundOutputIndex);
+        requireFeeRefund(feeRefund, feeInputIndex, feeOutputIndex);
+    }
+
+    entry vetoPolicy(
+        DelegationState[] nextDelegations, TokenState[] returnedKps,
+        byte[] delegationInputIndexes, byte reserveInputIndex,
+        ReserveState nextReserve, TokenState reserveOutput, byte refundOutputIndex
+    ) {
+        requireGovernanceAndTermination();
+        require(!activated);
+        int reserveIdx = unsigned(reserveInputIndex);
+        require(reserveIdx < tx.inputs.length);
+        byte[32] authenticatedReserveId = OpInputCovenantId(reserveIdx);
+        ReserveState reserve = readInputStateWithTemplate(reserveIdx,
+            reservePrefixLen, reserveSuffixLen, reserveTemplateHash);
+        require(reserve.kpsAssetId != authenticatedReserveId && reserve.totalKps > 0);
+        require(nextReserve.kusdAssetId == reserve.kusdAssetId);
+        require(nextReserve.kpsAssetId == reserve.kpsAssetId);
+        require(reserve.reserveKusd <= MAX_INT - initProposalFeeKusd);
+        require(nextReserve.reserveKusd == reserve.reserveKusd + initProposalFeeKusd);
+        require(nextReserve.totalKps == reserve.totalKps);
+        require(nextReserve.collateralSompi == reserve.collateralSompi);
+        require(nextReserve.auctionPrefixLenState == reserve.auctionPrefixLenState);
+        require(nextReserve.auctionSuffixLenState == reserve.auctionSuffixLenState);
+        require(nextReserve.auctionTemplateHashState == reserve.auctionTemplateHashState);
+        int reserveOut = OpCovOutputIdx(authenticatedReserveId, 0);
+        validateOutputStateWithInputTemplate(reserveOut, nextReserve, reserveIdx,
+            reservePrefixLen, reserveSuffixLen, reserveTemplateHash);
+        require(tx.outputs[reserveOut].value == tx.inputs[reserveIdx].value);
+
+        byte[32] proposalId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(assetId) == 2 && OpCovOutputCount(assetId) == 1);
+        int reserveTokenInput = OpCovInputIdx(assetId, 0);
+        int feeInput = OpCovInputIdx(assetId, 1);
+        TokenState oldReserve = readInputStateWithTemplate(reserveTokenInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState fee = readInputStateWithTemplate(feeInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        require(oldReserve.ownerIdentifier == authenticatedReserveId);
+        require(oldReserve.identifierType == 0x02 && !oldReserve.isMinter);
+        require(oldReserve.amount == reserve.reserveKusd);
+        require(fee.ownerIdentifier == proposalId && fee.identifierType == 0x02);
+        require(fee.amount == initProposalFeeKusd && !fee.isMinter);
+        require(reserveOutput.ownerIdentifier == authenticatedReserveId);
+        require(reserveOutput.identifierType == 0x02 && !reserveOutput.isMinter);
+        require(reserveOutput.amount == nextReserve.reserveKusd);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(assetId, 0), reserveOutput,
+            reserveTokenInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+
+        byte[32] authenticatedKpsId = reserve.kpsAssetId;
+        int count = OpCovInputCount(authenticatedKpsId);
+        require(count > 0 && count <= 8);
+        require(returnedKps.length == count && nextDelegations.length == count);
+        require(delegationInputIndexes.length == count);
+        require(OpCovOutputCount(authenticatedKpsId) == count);
+        int votes = 0;
+        int previousDelegationIdx = -1;
+        for(i, 0, count, 8) {
+            int inputIdx = OpCovInputIdx(authenticatedKpsId, i);
+            int delegationIdx = unsigned(delegationInputIndexes[i]);
+            require(delegationIdx < tx.inputs.length && delegationIdx > previousDelegationIdx);
+            previousDelegationIdx = delegationIdx;
+            byte[32] delegationId = OpInputCovenantId(delegationIdx);
+            require(delegationId != authenticatedKpsId);
+            require(OpCovInputCount(delegationId) == 1);
+            require(OpCovOutputCount(delegationId) == 1);
+            DelegationState delegation = readInputStateWithTemplate(delegationIdx,
+                delegationPrefixLen, delegationSuffixLen, delegationTemplateHash);
+            require(delegation.kpsId == authenticatedKpsId && delegation.amount > 0);
+            require(delegation.weight > 0 && delegation.weight <= maxVoteWeight);
+            require(nextDelegations[i].owner == delegation.owner);
+            require(nextDelegations[i].delegate == delegation.delegate);
+            require(nextDelegations[i].kpsId == delegation.kpsId);
+            require(nextDelegations[i].amount == delegation.amount);
+            require(nextDelegations[i].weight == delegation.weight);
+            int delegationOut = OpCovOutputIdx(delegationId, 0);
+            validateOutputStateWithInputTemplate(delegationOut, nextDelegations[i], delegationIdx,
+                delegationPrefixLen, delegationSuffixLen, delegationTemplateHash);
+            require(tx.outputs[delegationOut].value == tx.inputs[delegationIdx].value);
+
+            TokenState share = readInputStateWithTemplate(inputIdx,
+                kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+            require(!share.isMinter && share.amount > 0);
+            require(share.ownerIdentifier == delegationId && share.identifierType == 0x02);
+            require(share.amount == delegation.amount);
+            require(returnedKps[i].ownerIdentifier == share.ownerIdentifier);
+            require(returnedKps[i].identifierType == share.identifierType);
+            require(returnedKps[i].amount == share.amount && !returnedKps[i].isMinter);
+            int outputIdx = OpCovOutputIdx(authenticatedKpsId, i);
+            validateOutputStateWithInputTemplate(outputIdx, returnedKps[i], inputIdx,
+                kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+            require(share.amount <= MAX_INT / delegation.weight);
+            int weightedShare = share.amount * delegation.weight;
+            require(weightedShare <= MAX_INT - votes);
+            votes = votes + weightedShare;
+        }
+        require(vetoThresholdPpm > 0 && vetoThresholdPpm <= PPM);
+        require(maxVoteWeight > 0 && maxVoteWeight <= 16);
+        require(reserve.totalKps <= MAX_INT / maxVoteWeight);
+        int weightedSupply = reserve.totalKps * maxVoteWeight;
+        int requiredVotes = (weightedSupply / PPM) * vetoThresholdPpm;
+        int remainderProduct = (weightedSupply % PPM) * vetoThresholdPpm;
+        requiredVotes = requiredVotes + remainderProduct / PPM;
+        if (remainderProduct % PPM != 0) { requiredVotes = requiredVotes + 1; }
+        require(votes >= requiredVotes);
+        requireRefund(refundOutputIndex);
+    }
+}

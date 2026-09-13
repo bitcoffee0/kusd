@@ -1,0 +1,38 @@
+pragma silverscript ^0.1.0;
+
+// Stable anchor created before the economic stack. It breaks the genesis cycle
+// between Reserve and SavingsController without trusting a template alone.
+contract SavingsRegistry(
+    pubkey initBootstrapOwner, byte[32] initControllerId, bool initInitialized
+) {
+    pubkey bootstrapOwner = initBootstrapOwner;
+    byte[32] controllerId = initControllerId;
+    bool initialized = initInitialized;
+
+    byte[32] constant ZERO = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+    function requireSuccessor(State nextState) {
+        byte[32] registryId = OpInputCovenantId(this.activeInputIndex);
+        int successor = OpCovOutputIdx(registryId, 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+        require(nextState.bootstrapOwner == bootstrapOwner);
+    }
+
+    #[covenant.singleton(name = initialize)]
+    function initializePolicy(State prevState, State nextState, sig ownerSig) {
+        require(!prevState.initialized && prevState.controllerId == ZERO);
+        require(nextState.initialized && nextState.controllerId != ZERO);
+        require(checkSig(ownerSig, prevState.bootstrapOwner));
+        requireSuccessor(nextState);
+    }
+
+    // Every interaction reading Registry must also reproduce exactly
+    // its state and value, preventing removal or substitution.
+    #[covenant.singleton(name = preserve)]
+    function preservePolicy(State prevState, State nextState) {
+        require(prevState.initialized && prevState.controllerId != ZERO);
+        require(nextState.initialized == prevState.initialized);
+        require(nextState.controllerId == prevState.controllerId);
+        requireSuccessor(nextState);
+    }
+}

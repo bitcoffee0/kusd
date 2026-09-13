@@ -1,0 +1,40 @@
+[package]
+name = "kaspa-kusd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "kusd"
+autobins = false
+
+[dependencies]
+silverscript-lang = { path = "vendor/silverscript/silverscript-lang" }
+silverscript-abi = { path = "vendor/silverscript/silverscript-abi" }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+kaspa-txscript-errors = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+secp256k1 = { version = "0.29.0", features = ["global-context", "rand-std"] }
+clap = { version = "4.6", features = ["derive"] }
+dotenvy = "0.15"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[[bin]]
+name = "kusd"
+path = "src/main.rs"
+
+[[bin]]
+name = "protocol-tool"
+path = "src/bin/protocol_tool.rs"
+
+[[bin]]
+name = "savings-tool"
+path = "src/bin/savings_tool.rs"
+
+[[bin]]
+name = "tx-diagnose"
+path = "src/bin/tx_diagnose.rs"

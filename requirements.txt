@@ -1,0 +1,2 @@
+# SDK used by network builders and validation commands.
+kaspa==2.0.2rc1

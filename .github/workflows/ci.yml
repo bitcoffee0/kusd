@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Fetch pinned SilverScript
+        run: |
+          git clone https://github.com/kaspanet/silverscript.git vendor/silverscript
+          git -C vendor/silverscript checkout 3ed973335b59269293564805cc2c58a14595ec03
+      - name: Test SilverScript
+        run: cargo test --locked --manifest-path vendor/silverscript/Cargo.toml -p silverscript-lang
+      - name: Test KUSD
+        run: cargo test --locked --all-targets
+      - name: Check network builder syntax
+        run: python3 -m py_compile scripts/*.py

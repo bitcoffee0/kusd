@@ -1,0 +1,142 @@
+pragma silverscript ^0.1.0;
+
+// Compact Position representation during a Challenge. It only implements
+// avert/settle paths so Reserve backstop remains within consensus compute and
+// storage-mass limits.
+contract ChallengedPosition(
+    pubkey initOwner, byte[32] initAssetId,
+    int initDebt, int initAssignedReserve, byte[32] initReserveId,
+    int initReserveContributionPpm, int initLiquidationPrice,
+    int initChallengePeriodDaa, int initAuctionDurationDaa, int initChallengeRewardPpm,
+    byte[32] initChallengeId, int initKccPrefixLen, int initKccSuffixLen,
+    byte[32] initKccTemplateHash,
+    int initPositionPrefixLen, int initPositionSuffixLen,
+    byte[32] initPositionTemplateHash,
+    int challengeTemplatePrefixLen, int challengeTemplateSuffixLen,
+    byte[32] challengeTemplateHash,
+    int auctionTemplatePrefixLen, int auctionTemplateSuffixLen,
+    byte[32] auctionTemplateHash
+) {
+    pubkey owner = initOwner;
+    byte[32] assetId = initAssetId; int debt = initDebt;
+    int assignedReserve = initAssignedReserve; byte[32] reserveId = initReserveId;
+    int reserveContributionPpm = initReserveContributionPpm;
+    int liquidationPrice = initLiquidationPrice;
+    int challengePeriodDaa = initChallengePeriodDaa;
+    int auctionDurationDaa = initAuctionDurationDaa;
+    int challengeRewardPpm = initChallengeRewardPpm;
+    byte[32] challengeId = initChallengeId;
+    int kccPrefixLen = initKccPrefixLen; int kccSuffixLen = initKccSuffixLen;
+    byte[32] kccTemplateHash = initKccTemplateHash;
+    int positionPrefixLen = initPositionPrefixLen;
+    int positionSuffixLen = initPositionSuffixLen;
+    byte[32] positionTemplateHash = initPositionTemplateHash;
+
+    struct ChallengeState {
+        pubkey owner; pubkey challenger; byte[32] positionId; byte[32] assetId; int debt;
+        int assignedReserve; byte[32] reserveId; int liquidationPrice;
+        int rewardPpm; int challengePeriodDaa; int auctionDurationDaa; int collateralSompi;
+        int kccPrefixLen; int kccSuffixLen; byte[32] kccTemplateHash;
+    }
+    struct AuctionState {
+        pubkey positionOwner; pubkey challenger; byte[32] positionId; byte[32] assetId; int debt;
+        int assignedReserve; byte[32] reserveId; int liquidationPrice;
+        int rewardPpm; int auctionDurationDaa; int collateralSompi;
+        int kccPrefixLen; int kccSuffixLen; byte[32] kccTemplateHash;
+    }
+
+    function requireIdentity(State a, State b) {
+        require(b.owner == a.owner);
+        require(b.assetId == a.assetId && b.debt == a.debt);
+        require(b.assignedReserve == a.assignedReserve && b.reserveId == a.reserveId);
+        require(b.reserveContributionPpm == a.reserveContributionPpm);
+        require(b.liquidationPrice == a.liquidationPrice);
+        require(b.challengePeriodDaa == a.challengePeriodDaa);
+        require(b.auctionDurationDaa == a.auctionDurationDaa);
+        require(b.challengeRewardPpm == a.challengeRewardPpm);
+        require(b.kccPrefixLen == a.kccPrefixLen && b.kccSuffixLen == a.kccSuffixLen);
+        require(b.kccTemplateHash == a.kccTemplateHash);
+        require(b.positionPrefixLen == a.positionPrefixLen);
+        require(b.positionSuffixLen == a.positionSuffixLen);
+        require(b.positionTemplateHash == a.positionTemplateHash);
+    }
+
+    function requireChallenge(State p, ChallengeState c) {
+        require(c.owner == p.owner);
+        require(c.positionId == OpInputCovenantId(this.activeInputIndex));
+        require(c.assetId == p.assetId && c.debt == p.debt);
+        require(c.assignedReserve == p.assignedReserve && c.reserveId == p.reserveId);
+        require(c.liquidationPrice == p.liquidationPrice);
+        require(c.rewardPpm == p.challengeRewardPpm && c.challengePeriodDaa == p.challengePeriodDaa);
+        require(c.auctionDurationDaa == p.auctionDurationDaa);
+        require(c.collateralSompi == tx.inputs[this.activeInputIndex].value);
+        require(c.kccPrefixLen == p.kccPrefixLen && c.kccSuffixLen == p.kccSuffixLen);
+        require(c.kccTemplateHash == p.kccTemplateHash);
+    }
+
+    function requireSameChallenge(ChallengeState a, ChallengeState b) {
+        require(a.owner == b.owner && a.challenger == b.challenger && a.positionId == b.positionId);
+        require(a.assetId == b.assetId && a.debt == b.debt);
+        require(a.assignedReserve == b.assignedReserve && a.reserveId == b.reserveId);
+        require(a.liquidationPrice == b.liquidationPrice && a.rewardPpm == b.rewardPpm);
+        require(a.challengePeriodDaa == b.challengePeriodDaa && a.collateralSompi == b.collateralSompi);
+        require(a.auctionDurationDaa == b.auctionDurationDaa);
+        require(a.kccPrefixLen == b.kccPrefixLen && a.kccSuffixLen == b.kccSuffixLen);
+        require(a.kccTemplateHash == b.kccTemplateHash);
+    }
+
+    entry avertChallengePolicy(
+        byte activeOutputIndex, State activeState, byte[] activePrefix,
+        byte[] activeSuffix, ChallengeState supplied) {
+        require(challengeId != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(OpCovInputCount(challengeId) == 1);
+        int idx = OpCovInputIdx(challengeId, 0);
+        ChallengeState authenticated = readInputStateWithTemplate(idx,
+            challengeTemplatePrefixLen, challengeTemplateSuffixLen, challengeTemplateHash);
+        requireSameChallenge(authenticated, supplied); requireChallenge(activeState, supplied);
+        require(activeState.owner == owner);
+        require(activeState.assetId == assetId && activeState.debt == debt);
+        require(activeState.assignedReserve == assignedReserve && activeState.reserveId == reserveId);
+        require(activeState.reserveContributionPpm == reserveContributionPpm);
+        require(activeState.liquidationPrice == liquidationPrice);
+        require(activeState.challengePeriodDaa == challengePeriodDaa);
+        require(activeState.auctionDurationDaa == auctionDurationDaa);
+        require(activeState.challengeRewardPpm == challengeRewardPpm);
+        require(activeState.kccPrefixLen == kccPrefixLen && activeState.kccSuffixLen == kccSuffixLen);
+        require(activeState.kccTemplateHash == kccTemplateHash);
+        require(activeState.positionPrefixLen == positionPrefixLen);
+        require(activeState.positionSuffixLen == positionSuffixLen);
+        require(activeState.positionTemplateHash == positionTemplateHash);
+        require(activeState.challengeId == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(activePrefix.length == positionPrefixLen);
+        require(activeSuffix.length == positionSuffixLen);
+        require(templateHash(activePrefix, activeSuffix) == positionTemplateHash);
+        byte[32] positionId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovOutputCount(positionId) == 1);
+        int successor = unsigned(activeOutputIndex);
+        require(successor == OpCovOutputIdx(positionId, 0));
+        require(OpOutputCovenantId(successor) == positionId);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+        validateOutputStateWithTemplate(successor, activeState, activePrefix,
+            activeSuffix, positionTemplateHash);
+    }
+
+    entry settleAuctionPolicy() {
+        require(challengeId != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(OpCovInputCount(challengeId) == 1);
+        require(OpCovOutputCount(OpInputCovenantId(this.activeInputIndex)) == 0);
+        int idx = OpCovInputIdx(challengeId, 0);
+        AuctionState a = readInputStateWithTemplate(idx,
+            auctionTemplatePrefixLen, auctionTemplateSuffixLen, auctionTemplateHash);
+        require(a.positionId == OpInputCovenantId(this.activeInputIndex));
+        require(a.positionOwner == owner);
+        require(a.assetId == assetId && a.debt == debt);
+        require(a.assignedReserve == assignedReserve && a.reserveId == reserveId);
+        require(a.liquidationPrice == liquidationPrice);
+        require(a.rewardPpm == challengeRewardPpm);
+        require(a.auctionDurationDaa == auctionDurationDaa);
+        require(a.collateralSompi == tx.inputs[this.activeInputIndex].value);
+        require(a.kccPrefixLen == kccPrefixLen && a.kccSuffixLen == kccSuffixLen);
+        require(a.kccTemplateHash == kccTemplateHash);
+    }
+}

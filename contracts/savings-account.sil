@@ -1,0 +1,249 @@
+pragma silverscript ^0.1.0;
+
+// Segregated Savings account with an immutable series-rate snapshot. Toccata
+// does not expose ageDaa as an integer, so the owner signs the claimed elapsed
+// term while the consensus timelock prevents overstatement.
+contract SavingsAccount(
+    pubkey initOwner,
+    byte[32] initControllerId, byte[32] initReserveId, byte[32] initAssetId,
+    int initSaved, int initRatePpm,
+    int initDelayRemainingDaa, int initRemainingAccrualDaa,
+    int initDaaPerYear, pubkey initReferrer, int initReferralFeePpm,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash,
+    int initControllerPrefixLen, int initControllerSuffixLen,
+    byte[32] initControllerTemplateHash,
+    int initReservePrefixLen, int initReserveSuffixLen,
+    byte[32] initReserveTemplateHash
+) {
+    pubkey owner = initOwner;
+    byte[32] controllerId = initControllerId;
+    byte[32] reserveId = initReserveId;
+    byte[32] assetId = initAssetId;
+    int saved = initSaved;
+    int ratePpm = initRatePpm;
+    int delayRemainingDaa = initDelayRemainingDaa;
+    int remainingAccrualDaa = initRemainingAccrualDaa;
+    int daaPerYear = initDaaPerYear;
+    pubkey referrer = initReferrer;
+    int referralFeePpm = initReferralFeePpm;
+    int controllerPrefixLen = initControllerPrefixLen;
+    int controllerSuffixLen = initControllerSuffixLen;
+    byte[32] controllerTemplateHash = initControllerTemplateHash;
+    int reservePrefixLen = initReservePrefixLen;
+    int reserveSuffixLen = initReserveSuffixLen;
+    byte[32] reserveTemplateHash = initReserveTemplateHash;
+
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct ControllerState {
+        byte[32] assetId; byte[32] reserveId; byte[32] governanceId; bool enabled;
+        int seriesNonce; int accountNonce; int totalSaved;
+        int currentRatePpm; int interestDelayDaa;
+        int maxAccrualDaa; int daaPerYear;
+        int accountValueSompi;
+        int controllerPrefixLenState; int controllerSuffixLenState;
+        byte[32] controllerTemplateHashState;
+        int reservePrefixLenState; int reserveSuffixLenState;
+        byte[32] reserveTemplateHashState;
+    }
+    struct ReserveState {
+        byte[32] kusdAssetId; byte[32] kpsAssetId; int reserveKusd;
+        int totalKps; int collateralSompi; int auctionPrefixLenState;
+        int auctionSuffixLenState; byte[32] auctionTemplateHashState;
+    }
+
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    int constant PPM = 1000000;
+    int constant MAX_REFERRAL_PPM = 250000;
+    int constant MAX_INT = 9223372036854775807;
+    int constant MAX_AMOUNT = 36028797018963967;
+    int constant TOP_BIT = 18014398509481984;
+
+    function mulDivFloor(int x, int y, int d) : int {
+        require(x >= 0 && y >= 0 && d > 0);
+        require(x <= MAX_AMOUNT && y <= MAX_AMOUNT && d <= MAX_AMOUNT);
+        int result = 0;
+        if (x == 0 || y == 0) {
+            result = 0;
+        } else if (x == d) {
+            result = y;
+        } else if (y == d) {
+            result = x;
+        } else if (x <= MAX_INT / y) {
+            result = x * y / d;
+        } else {
+            int yQuotient = y / d;
+            int yRemainder = y % d;
+            int quotient = 0;
+            int remainder = 0;
+            int bitValue = TOP_BIT;
+            for(i, 0, 55, 55) {
+                quotient = quotient * 2;
+                int carry = 0;
+                if (remainder >= d - remainder) {
+                    remainder = remainder - (d - remainder);
+                    carry = 1;
+                } else {
+                    remainder = remainder * 2;
+                }
+                if ((x / bitValue) % 2 == 1) {
+                    quotient = quotient + yQuotient;
+                    if (remainder >= d - yRemainder) {
+                        remainder = remainder - (d - yRemainder);
+                        carry = carry + 1;
+                    } else {
+                        remainder = remainder + yRemainder;
+                    }
+                }
+                quotient = quotient + carry;
+                bitValue = bitValue / 2;
+            }
+            result = quotient;
+        }
+        return(result);
+    }
+
+    function requireIdentity(State a, State b) {
+        require(b.owner == a.owner && b.controllerId == a.controllerId);
+        require(b.reserveId == a.reserveId && b.assetId == a.assetId);
+        require(b.ratePpm == a.ratePpm && b.daaPerYear == a.daaPerYear);
+        require(b.referrer == a.referrer && b.referralFeePpm == a.referralFeePpm);
+        require(b.controllerPrefixLen == a.controllerPrefixLen);
+        require(b.controllerSuffixLen == a.controllerSuffixLen);
+        require(b.controllerTemplateHash == a.controllerTemplateHash);
+        require(b.reservePrefixLen == a.reservePrefixLen);
+        require(b.reserveSuffixLen == a.reserveSuffixLen);
+        require(b.reserveTemplateHash == a.reserveTemplateHash);
+    }
+
+    function requireToken(TokenState s, byte[32] tokenOwner, byte kind, int amount) {
+        require(s.ownerIdentifier == tokenOwner && s.identifierType == kind);
+        require(s.amount == amount && !s.isMinter);
+    }
+
+    #[covenant.singleton(name = refresh)]
+    function refreshPolicy(
+        State prevState, State nextState, sig ownerSig, int accrualDaa,
+        byte controllerInputIndex,
+        byte reserveInputIndex,
+        byte accountTokenInputIndex, byte reserveTokenInputIndex,
+        TokenState accountTokenOutput, TokenState referralOutput
+    ) {
+        require(checkSig(ownerSig, prevState.owner));
+        requireIdentity(prevState, nextState);
+        require(prevState.saved > 0 && prevState.saved <= MAX_AMOUNT);
+        require(prevState.ratePpm > 0 && prevState.ratePpm <= PPM);
+        require(prevState.daaPerYear > 0 && prevState.daaPerYear <= MAX_AMOUNT);
+        require(prevState.delayRemainingDaa >= 0);
+        require(accrualDaa > 0 && accrualDaa <= prevState.remainingAccrualDaa);
+        require(prevState.delayRemainingDaa <= MAX_AMOUNT - accrualDaa);
+        require(this.ageDaa >= prevState.delayRemainingDaa + accrualDaa);
+        require(prevState.referralFeePpm >= 0 && prevState.referralFeePpm <= MAX_REFERRAL_PPM);
+
+        int annualInterest = mulDivFloor(prevState.saved, prevState.ratePpm, PPM);
+        int grossInterest = mulDivFloor(annualInterest, accrualDaa, prevState.daaPerYear);
+        require(grossInterest > 0);
+        int referralFee = mulDivFloor(grossInterest, prevState.referralFeePpm, PPM);
+        int netInterest = grossInterest - referralFee;
+        require(netInterest > 0 && prevState.saved <= MAX_AMOUNT - netInterest);
+        require(nextState.saved == prevState.saved + netInterest);
+        require(nextState.delayRemainingDaa == 0);
+        require(nextState.remainingAccrualDaa == prevState.remainingAccrualDaa - accrualDaa);
+
+        int controllerIdx = unsigned(controllerInputIndex);
+        require(controllerIdx < tx.inputs.length);
+        require(OpInputCovenantId(controllerIdx) == prevState.controllerId);
+
+        int reserveIdx = unsigned(reserveInputIndex);
+        require(reserveIdx < tx.inputs.length);
+        require(OpInputCovenantId(reserveIdx) == prevState.reserveId);
+
+        require(OpCovInputCount(prevState.assetId) == 2);
+        int accountTokenIdx = unsigned(accountTokenInputIndex);
+        int reserveTokenIdx = unsigned(reserveTokenInputIndex);
+        require(accountTokenIdx < tx.inputs.length && reserveTokenIdx < tx.inputs.length);
+        require(accountTokenIdx != reserveTokenIdx);
+        TokenState accountToken = readInputStateWithTemplate(accountTokenIdx,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState reserveToken = readInputStateWithTemplate(reserveTokenIdx,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        byte[32] accountId = OpInputCovenantId(this.activeInputIndex);
+        requireToken(accountToken, accountId, IDENTIFIER_COVENANT_ID, prevState.saved);
+        require(reserveToken.ownerIdentifier == prevState.reserveId);
+        require(reserveToken.identifierType == IDENTIFIER_COVENANT_ID && !reserveToken.isMinter);
+        require(reserveToken.amount >= grossInterest);
+        requireToken(accountTokenOutput, accountId, IDENTIFIER_COVENANT_ID, nextState.saved);
+        if (referralFee > 0) {
+            require(OpCovOutputCount(prevState.assetId) == 3);
+            requireToken(referralOutput, byte[32](prevState.referrer),
+                IDENTIFIER_PUBKEY, referralFee);
+        } else {
+            require(OpCovOutputCount(prevState.assetId) == 2);
+            require(referralOutput.amount == 0);
+        }
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 0),
+            accountTokenOutput, accountTokenIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        if (referralFee > 0) {
+            validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 2),
+                referralOutput, reserveTokenIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        }
+        int successor = OpCovOutputIdx(accountId, 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(mode = verification, termination = allowed, name = close)]
+    function closePolicy(
+        State prevState, State[] nextStates, sig ownerSig,
+        byte controllerInputIndex, ControllerState nextController,
+        byte accountTokenInputIndex, TokenState ownerPayout,
+        byte kasOutputIndex
+    ) {
+        require(nextStates.length == 0 && checkSig(ownerSig, prevState.owner));
+        require(prevState.saved > 0);
+        int controllerIdx = unsigned(controllerInputIndex);
+        require(controllerIdx < tx.inputs.length);
+        require(OpInputCovenantId(controllerIdx) == prevState.controllerId);
+        ControllerState controller = readInputStateWithTemplate(controllerIdx,
+            prevState.controllerPrefixLen, prevState.controllerSuffixLen,
+            prevState.controllerTemplateHash);
+        require(controller.assetId == prevState.assetId && controller.reserveId == prevState.reserveId);
+        require(controller.totalSaved >= prevState.saved);
+        require(nextController.assetId == controller.assetId);
+        require(nextController.reserveId == controller.reserveId);
+        require(nextController.governanceId == controller.governanceId);
+        require(nextController.enabled == controller.enabled);
+        require(nextController.seriesNonce == controller.seriesNonce);
+        require(nextController.accountNonce == controller.accountNonce);
+        require(nextController.totalSaved == controller.totalSaved - prevState.saved);
+        require(nextController.currentRatePpm == controller.currentRatePpm);
+        require(nextController.interestDelayDaa == controller.interestDelayDaa);
+        require(nextController.maxAccrualDaa == controller.maxAccrualDaa);
+        require(nextController.daaPerYear == controller.daaPerYear);
+        require(nextController.accountValueSompi == controller.accountValueSompi);
+        require(nextController.controllerPrefixLenState == controller.controllerPrefixLenState);
+        require(nextController.controllerSuffixLenState == controller.controllerSuffixLenState);
+        require(nextController.controllerTemplateHashState == controller.controllerTemplateHashState);
+        require(nextController.reservePrefixLenState == controller.reservePrefixLenState);
+        require(nextController.reserveSuffixLenState == controller.reserveSuffixLenState);
+        require(nextController.reserveTemplateHashState == controller.reserveTemplateHashState);
+
+        require(OpCovInputCount(prevState.assetId) == 1);
+        require(OpCovOutputCount(prevState.assetId) == 1);
+        int tokenIdx = unsigned(accountTokenInputIndex);
+        require(tokenIdx < tx.inputs.length);
+        TokenState token = readInputStateWithTemplate(tokenIdx,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(token, OpInputCovenantId(this.activeInputIndex),
+            IDENTIFIER_COVENANT_ID, prevState.saved);
+        requireToken(ownerPayout, byte[32](prevState.owner), IDENTIFIER_PUBKEY, prevState.saved);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 0),
+            ownerPayout, tokenIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+
+        int kasIdx = unsigned(kasOutputIndex);
+        require(kasIdx < tx.outputs.length);
+        require(tx.outputs[kasIdx].scriptPubKey == byte[](new ScriptPubKeyP2PK(prevState.owner)));
+        require(tx.outputs[kasIdx].value == tx.inputs[this.activeInputIndex].value);
+    }
+}

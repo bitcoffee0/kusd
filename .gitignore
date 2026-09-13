@@ -1,0 +1,13 @@
+.env
+*.env.local
+.venv/
+target/
+vendor/
+artifacts/
+*.local.toml
+*.local.json
+*.local.txt
+*.local.log
+*~
+__pycache__/
+*.py[cod]

@@ -1,0 +1,77 @@
+pragma silverscript ^0.1.0;
+
+// Savings-series proposal. Governor creates this UTXO; activation becomes
+// permissionless after the delay, then execute/veto/cancel terminates it once.
+contract SavingsProposal(
+    pubkey initProposer,
+    byte[32] initGovernanceId, byte[32] initControllerId, byte[32] initAssetId,
+    int initProposalNonce, bool initActivated,
+    int initRatePpm, int initInterestDelayDaa,
+    int initMaxAccrualDaa, int initDaaPerYear,
+    int initVotingDelayDaa, int initExecutionWindowDaa,
+    int initDepositSompi
+) {
+    pubkey proposer = initProposer;
+    byte[32] governanceId = initGovernanceId;
+    byte[32] controllerId = initControllerId;
+    byte[32] assetId = initAssetId;
+    int proposalNonce = initProposalNonce;
+    bool activated = initActivated;
+    int ratePpm = initRatePpm;
+    int interestDelayDaa = initInterestDelayDaa;
+    int maxAccrualDaa = initMaxAccrualDaa;
+    int daaPerYear = initDaaPerYear;
+    int votingDelayDaa = initVotingDelayDaa;
+    int executionWindowDaa = initExecutionWindowDaa;
+    int depositSompi = initDepositSompi;
+
+    function requireIdentity(State a, State b) {
+        require(b.proposer == a.proposer && b.governanceId == a.governanceId);
+        require(b.controllerId == a.controllerId && b.assetId == a.assetId);
+        require(b.proposalNonce == a.proposalNonce && b.ratePpm == a.ratePpm);
+        require(b.interestDelayDaa == a.interestDelayDaa);
+        require(b.maxAccrualDaa == a.maxAccrualDaa && b.daaPerYear == a.daaPerYear);
+        require(b.votingDelayDaa == a.votingDelayDaa);
+        require(b.executionWindowDaa == a.executionWindowDaa);
+        require(b.depositSompi == a.depositSompi);
+    }
+
+    function requireTerminationAndRefund(byte refundOutputIndex) {
+        byte[32] proposalId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(proposalId) == 1 && OpCovOutputCount(proposalId) == 0);
+        int idx = unsigned(refundOutputIndex);
+        require(idx < tx.outputs.length);
+        require(tx.outputs[idx].scriptPubKey == byte[](new ScriptPubKeyP2PK(proposer)));
+        require(tx.outputs[idx].value == depositSompi);
+        require(tx.inputs[this.activeInputIndex].value == depositSompi);
+    }
+
+    #[covenant.singleton(name = activate)]
+    function activatePolicy(State prevState, State nextState) {
+        require(!prevState.activated && nextState.activated);
+        requireIdentity(prevState, nextState);
+        require(this.ageDaa >= prevState.votingDelayDaa);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    entry executePolicy(byte refundOutputIndex) {
+        require(activated);
+        require(OpCovInputCount(governanceId) == 1);
+        require(OpCovInputCount(controllerId) == 1);
+        requireTerminationAndRefund(refundOutputIndex);
+    }
+
+    entry vetoPolicy(byte refundOutputIndex) {
+        require(!activated);
+        require(OpCovInputCount(governanceId) == 1);
+        requireTerminationAndRefund(refundOutputIndex);
+    }
+
+    entry cancelExpiredPolicy(byte refundOutputIndex) {
+        require(activated);
+        require(this.ageDaa >= executionWindowDaa);
+        require(OpCovInputCount(governanceId) == 1);
+        requireTerminationAndRefund(refundOutputIndex);
+    }
+}

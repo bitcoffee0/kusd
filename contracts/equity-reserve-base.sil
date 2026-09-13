@@ -1,0 +1,371 @@
+pragma silverscript ^0.1.0;
+
+contract EquityReserveBase(
+    byte[32] initKusdAssetId, byte[32] initKpsAssetId,
+    int initReserveKusd, int initTotalKps, int initCollateralSompi,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash,
+    int kpsPrefixLen, int kpsSuffixLen, byte[32] kpsTemplateHash,
+    int auctionPrefixLen, int auctionSuffixLen, byte[32] auctionTemplateHash
+) {
+    byte[32] kusdAssetId = initKusdAssetId;
+    byte[32] kpsAssetId = initKpsAssetId;
+    int reserveKusd = initReserveKusd;
+    int totalKps = initTotalKps;
+    int collateralSompi = initCollateralSompi;
+    int auctionPrefixLenState = auctionPrefixLen;
+    int auctionSuffixLenState = auctionSuffixLen;
+    byte[32] auctionTemplateHashState = auctionTemplateHash;
+
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct AuctionState {
+        pubkey positionOwner; pubkey challenger; byte[32] positionId; byte[32] assetId; int debt;
+        int assignedReserve; byte[32] reserveId; int liquidationPrice; int rewardPpm;
+        int auctionDurationDaa;
+        int collateralSompi; int kccPrefixLen; int kccSuffixLen;
+        byte[32] kccTemplateHash;
+    }
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    int constant MAX_INT = 9223372036854775807;
+    int constant MAX_AMOUNT = 36028797018963967;
+    int constant TOP_BIT = 18014398509481984;
+
+    function mulDivFloor(int x, int y, int d) : int {
+        require(x >= 0 && y >= 0 && d > 0);
+        require(x <= MAX_AMOUNT && y <= MAX_AMOUNT && d <= MAX_AMOUNT);
+        int result = 0;
+        if (x == 0 || y == 0) {
+            result = 0;
+        } else if (x == d) {
+            result = y;
+        } else if (y == d) {
+            result = x;
+        } else if (x <= MAX_INT / y) {
+            result = x * y / d;
+        } else {
+            int yQuotient = y / d;
+            int yRemainder = y % d;
+            int quotient = 0;
+            int remainder = 0;
+            int bitValue = TOP_BIT;
+            for(i, 0, 55, 55) {
+                quotient = quotient * 2;
+                int carry = 0;
+                if (remainder >= d - remainder) {
+                    remainder = remainder - (d - remainder);
+                    carry = 1;
+                } else {
+                    remainder = remainder * 2;
+                }
+                if ((x / bitValue) % 2 == 1) {
+                    quotient = quotient + yQuotient;
+                    if (remainder >= d - yRemainder) {
+                        remainder = remainder - (d - yRemainder);
+                        carry = carry + 1;
+                    } else {
+                        remainder = remainder + yRemainder;
+                    }
+                }
+                quotient = quotient + carry;
+                bitValue = bitValue / 2;
+            }
+            result = quotient;
+        }
+        return(result);
+    }
+
+    function mulPpm(int amount, int rate) : int {
+        require(amount >= 0 && amount <= MAX_AMOUNT);
+        require(rate >= 0 && rate <= 1000000);
+        int result = (amount / 1000000) * rate;
+        result = result + (amount % 1000000) * rate / 1000000;
+        return(result);
+    }
+
+    function requireIdentity(State a, State b) {
+        require(b.kusdAssetId == a.kusdAssetId);
+        require(b.kpsAssetId == a.kpsAssetId);
+        require(b.auctionPrefixLenState == a.auctionPrefixLenState);
+        require(b.auctionSuffixLenState == a.auctionSuffixLenState);
+        require(b.auctionTemplateHashState == a.auctionTemplateHashState);
+    }
+
+    function requireToken(TokenState s, byte[32] owner, byte kind, int amount, bool minter) {
+        require(s.ownerIdentifier == owner);
+        require(s.identifierType == kind);
+        require(s.amount == amount);
+        require(s.isMinter == minter);
+    }
+
+    #[covenant.singleton(name = initialize)]
+    function initializePolicy(
+        State prevState, State nextState, pubkey depositor, int depositAmount,
+        TokenState reserveOutput, TokenState kpsMinterOutput, TokenState depositorShares
+    ) {
+        require(prevState.kpsAssetId == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(nextState.kpsAssetId != prevState.kpsAssetId);
+        require(nextState.kusdAssetId == prevState.kusdAssetId);
+        require(prevState.reserveKusd == 0 && prevState.totalKps == 0 && prevState.collateralSompi == 0);
+        require(depositAmount > 0);
+        require(nextState.reserveKusd == depositAmount);
+        require(nextState.totalKps == depositAmount);
+        require(nextState.collateralSompi == 0);
+        require(nextState.auctionPrefixLenState == prevState.auctionPrefixLenState);
+        require(nextState.auctionSuffixLenState == prevState.auctionSuffixLenState);
+        require(nextState.auctionTemplateHashState == prevState.auctionTemplateHashState);
+
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(prevState.kusdAssetId) == 1);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 1);
+        int depositInput = OpCovInputIdx(prevState.kusdAssetId, 0);
+        TokenState deposit = readInputStateWithTemplate(depositInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(deposit, byte[32](depositor), IDENTIFIER_PUBKEY, depositAmount, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID, depositAmount, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, depositInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+
+        require(OpCovInputCount(nextState.kpsAssetId) == 1);
+        require(OpCovOutputCount(nextState.kpsAssetId) == 2);
+        int minterInput = OpCovInputIdx(nextState.kpsAssetId, 0);
+        TokenState minter = readInputStateWithTemplate(minterInput,
+            kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        requireToken(minter, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        requireToken(kpsMinterOutput, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        requireToken(depositorShares, byte[32](depositor), IDENTIFIER_PUBKEY, depositAmount, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(nextState.kpsAssetId, 0),
+            kpsMinterOutput, minterInput, kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(nextState.kpsAssetId, 1),
+            depositorShares, minterInput, kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+    }
+
+    #[covenant.singleton(name = deposit)]
+    function depositPolicy(
+        State prevState, State nextState, pubkey depositor, int depositAmount,
+        TokenState reserveOutput, TokenState kpsMinterOutput, TokenState depositorShares
+    ) {
+        requireIdentity(prevState, nextState);
+        require(depositAmount > 0 && prevState.reserveKusd >= 0 && prevState.totalKps >= 0);
+        require(prevState.collateralSompi == 0);
+        int minted = depositAmount;
+        if (prevState.totalKps > 0) {
+            require(prevState.reserveKusd > 0);
+            // Deposits may be split; this guard preserves the
+            // compact path, while redeem uses exact mulDiv arithmetic.
+            require(depositAmount <= MAX_INT / prevState.totalKps);
+            minted = depositAmount * prevState.totalKps / prevState.reserveKusd;
+        } else {
+            require(prevState.reserveKusd == 0);
+        }
+        require(minted > 0);
+        require(nextState.reserveKusd == prevState.reserveKusd + depositAmount);
+        require(nextState.totalKps == prevState.totalKps + minted);
+        require(nextState.collateralSompi == prevState.collateralSompi);
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+
+        require(OpCovInputCount(prevState.kusdAssetId) == 2);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 1);
+        int reserveInput = OpCovInputIdx(prevState.kusdAssetId, 0);
+        int depositInput = OpCovInputIdx(prevState.kusdAssetId, 1);
+        TokenState oldReserve = readInputStateWithTemplate(reserveInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState deposit = readInputStateWithTemplate(depositInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(oldReserve, reserveId, IDENTIFIER_COVENANT_ID, prevState.reserveKusd, false);
+        requireToken(deposit, byte[32](depositor), IDENTIFIER_PUBKEY, depositAmount, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID, nextState.reserveKusd, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+
+        require(OpCovInputCount(prevState.kpsAssetId) == 1);
+        require(OpCovOutputCount(prevState.kpsAssetId) == 2);
+        int minterInput = OpCovInputIdx(prevState.kpsAssetId, 0);
+        TokenState minter = readInputStateWithTemplate(minterInput,
+            kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        requireToken(minter, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        requireToken(kpsMinterOutput, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        requireToken(depositorShares, byte[32](depositor), IDENTIFIER_PUBKEY, minted, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kpsAssetId, 0),
+            kpsMinterOutput, minterInput, kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kpsAssetId, 1),
+            depositorShares, minterInput, kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+    }
+
+    #[covenant.singleton(name = collect_fee)]
+    function collectFeePolicy(
+        State prevState, State nextState, int feeAmount, TokenState reserveOutput
+    ) {
+        requireIdentity(prevState, nextState);
+        require(feeAmount > 0);
+        require(nextState.reserveKusd == prevState.reserveKusd + feeAmount);
+        require(nextState.totalKps == prevState.totalKps);
+        require(nextState.collateralSompi == prevState.collateralSompi);
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(prevState.kusdAssetId) == 2);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 1);
+        int reserveInput = OpCovInputIdx(prevState.kusdAssetId, 0);
+        int feeInput = OpCovInputIdx(prevState.kusdAssetId, 1);
+        TokenState oldReserve = readInputStateWithTemplate(reserveInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState fee = readInputStateWithTemplate(feeInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(oldReserve, reserveId, IDENTIFIER_COVENANT_ID, prevState.reserveKusd, false);
+        requireToken(fee, reserveId, IDENTIFIER_COVENANT_ID, feeAmount, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID, nextState.reserveKusd, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+    }
+
+    #[covenant.singleton(name = collect_proposal_fee)]
+    function collectProposalFeePolicy(
+        State prevState, State nextState, byte[32] proposalId, int feeAmount,
+        TokenState reserveOutput
+    ) {
+        requireIdentity(prevState, nextState);
+        require(feeAmount > 0);
+        require(nextState.reserveKusd == prevState.reserveKusd + feeAmount);
+        require(nextState.totalKps == prevState.totalKps);
+        require(nextState.collateralSompi == prevState.collateralSompi);
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(prevState.kusdAssetId) == 2);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 1);
+        int reserveInput = OpCovInputIdx(prevState.kusdAssetId, 0);
+        int feeInput = OpCovInputIdx(prevState.kusdAssetId, 1);
+        TokenState oldReserve = readInputStateWithTemplate(reserveInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState fee = readInputStateWithTemplate(feeInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(oldReserve, reserveId, IDENTIFIER_COVENANT_ID,
+            prevState.reserveKusd, false);
+        require(OpCovInputCount(proposalId) == 1);
+        requireToken(fee, proposalId, IDENTIFIER_COVENANT_ID, feeAmount, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID,
+            nextState.reserveKusd, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+    }
+
+    #[covenant.singleton(name = redeem)]
+    function redeemPolicy(
+        State prevState, State nextState, pubkey redeemer, int burnedShares,
+        TokenState reserveOutput, TokenState redeemerPayout,
+        TokenState kpsMinterOutput, byte collateralOutputIndex
+    ) {
+        requireIdentity(prevState, nextState);
+        require(burnedShares > 0 && burnedShares <= prevState.totalKps);
+        require(prevState.reserveKusd >= 0 && prevState.collateralSompi >= 0);
+        int payout = mulDivFloor(burnedShares, prevState.reserveKusd, prevState.totalKps);
+        int payoutKas = mulDivFloor(burnedShares, prevState.collateralSompi, prevState.totalKps);
+        require(payout > 0 || payoutKas > 0);
+        require(nextState.reserveKusd == prevState.reserveKusd - payout);
+        require(nextState.totalKps == prevState.totalKps - burnedShares);
+        require(nextState.collateralSompi == prevState.collateralSompi - payoutKas);
+
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+        int successorIdx = OpCovOutputIdx(reserveId, 0);
+        require(tx.outputs[successorIdx].value == tx.inputs[this.activeInputIndex].value - payoutKas);
+        if (payoutKas > 0) {
+            int collateralOut = unsigned(collateralOutputIndex);
+            require(collateralOut < tx.outputs.length);
+            require(tx.outputs[collateralOut].scriptPubKey == byte[](new ScriptPubKeyP2PK(redeemer)));
+            require(tx.outputs[collateralOut].value == payoutKas);
+        }
+
+        require(OpCovInputCount(prevState.kusdAssetId) == 1);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 2);
+        int reserveInput = OpCovInputIdx(prevState.kusdAssetId, 0);
+        TokenState oldReserve = readInputStateWithTemplate(reserveInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(oldReserve, reserveId, IDENTIFIER_COVENANT_ID, prevState.reserveKusd, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID, nextState.reserveKusd, false);
+        requireToken(redeemerPayout, byte[32](redeemer), IDENTIFIER_PUBKEY, payout, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 1),
+            redeemerPayout, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+
+        require(OpCovInputCount(prevState.kpsAssetId) == 2);
+        require(OpCovOutputCount(prevState.kpsAssetId) == 1);
+        int minterInput = OpCovInputIdx(prevState.kpsAssetId, 0);
+        int sharesInput = OpCovInputIdx(prevState.kpsAssetId, 1);
+        TokenState minter = readInputStateWithTemplate(minterInput,
+            kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        TokenState shares = readInputStateWithTemplate(sharesInput,
+            kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+        requireToken(minter, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        requireToken(shares, byte[32](redeemer), IDENTIFIER_PUBKEY, burnedShares, false);
+        requireToken(kpsMinterOutput, reserveId, IDENTIFIER_COVENANT_ID, 0, true);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kpsAssetId, 0),
+            kpsMinterOutput, minterInput, kpsPrefixLen, kpsSuffixLen, kpsTemplateHash);
+    }
+
+    #[covenant.singleton(name = backstop)]
+    function backstopPolicy(
+        State prevState, State nextState, byte auctionInputIndex,
+        AuctionState expectedAuction, TokenState reserveOutput,
+        TokenState challengerReward
+    ) {
+        requireIdentity(prevState, nextState);
+        byte[32] reserveId = OpInputCovenantId(this.activeInputIndex);
+        int auctionIdx = unsigned(auctionInputIndex);
+        require(auctionIdx < tx.inputs.length);
+        AuctionState auction = readInputStateWithTemplate(auctionIdx,
+            prevState.auctionPrefixLenState, prevState.auctionSuffixLenState,
+            prevState.auctionTemplateHashState);
+        require(auction.positionId == expectedAuction.positionId);
+        require(auction.assetId == prevState.kusdAssetId);
+        require(auction.debt == expectedAuction.debt);
+        require(auction.assignedReserve == expectedAuction.assignedReserve);
+        require(auction.reserveId == reserveId);
+        require(auction.liquidationPrice == expectedAuction.liquidationPrice);
+        require(auction.rewardPpm == expectedAuction.rewardPpm);
+        require(auction.auctionDurationDaa == expectedAuction.auctionDurationDaa);
+        require(auction.collateralSompi == expectedAuction.collateralSompi);
+        require(auction.challenger == expectedAuction.challenger);
+        require(auction.positionOwner == expectedAuction.positionOwner);
+        require(auction.debt > 0 && auction.rewardPpm > 0);
+        require(auction.assignedReserve >= 0 && auction.assignedReserve <= auction.debt);
+        int reward = mulPpm(auction.debt, auction.rewardPpm);
+        int payment = auction.debt - auction.assignedReserve + reward;
+        require(prevState.reserveKusd >= payment);
+        require(nextState.reserveKusd == prevState.reserveKusd - payment);
+        require(nextState.totalKps == prevState.totalKps);
+        require(nextState.collateralSompi == prevState.collateralSompi + auction.collateralSompi);
+
+        int successorIdx = OpCovOutputIdx(reserveId, 0);
+        require(tx.outputs[successorIdx].value ==
+            tx.inputs[this.activeInputIndex].value + auction.collateralSompi);
+        require(OpCovInputCount(prevState.kusdAssetId) == 3);
+        require(OpCovOutputCount(prevState.kusdAssetId) == 2);
+        int assignedInput = OpCovInputIdx(prevState.kusdAssetId, 1);
+        int reserveInput = OpCovInputIdx(prevState.kusdAssetId, 2);
+        TokenState assigned = readInputStateWithTemplate(assignedInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        TokenState oldReserve = readInputStateWithTemplate(reserveInput,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(oldReserve, reserveId, IDENTIFIER_COVENANT_ID, prevState.reserveKusd, false);
+        requireToken(assigned, auction.positionId, IDENTIFIER_COVENANT_ID,
+            auction.assignedReserve, false);
+        requireToken(reserveOutput, reserveId, IDENTIFIER_COVENANT_ID, nextState.reserveKusd, false);
+        requireToken(challengerReward, byte[32](auction.challenger),
+            IDENTIFIER_PUBKEY, reward, false);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 0),
+            reserveOutput, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.kusdAssetId, 1),
+            challengerReward, reserveInput, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+    }
+
+    // Authenticated totalKps read for veto. This transition cannot alter
+    // accounting assets, KAS value, or template identity.
+    #[covenant.singleton(name = governance_checkpoint)]
+    function governanceCheckpointPolicy(State prevState, State nextState) {
+        requireIdentity(prevState, nextState);
+        require(nextState.reserveKusd == prevState.reserveKusd);
+        require(nextState.totalKps == prevState.totalKps);
+        require(nextState.collateralSompi == prevState.collateralSompi);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+}

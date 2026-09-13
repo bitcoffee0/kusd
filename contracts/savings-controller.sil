@@ -1,0 +1,267 @@
+pragma silverscript ^0.1.0;
+
+// Singleton serializing Savings accounts. It is disabled at genesis. A series
+// can only be enabled from an authenticated, activated Savings proposal.
+contract SavingsController(
+    pubkey bootstrapOwner,
+    byte[32] initAssetId, byte[32] initReserveId, byte[32] initGovernanceId,
+    bool initEnabled, int initSeriesNonce, int initAccountNonce,
+    int initTotalSaved, int initCurrentRatePpm,
+    int initInterestDelayDaa, int initMaxAccrualDaa, int initDaaPerYear,
+    int initAccountValueSompi,
+    int initControllerPrefixLenState, int initControllerSuffixLenState,
+    byte[32] initControllerTemplateHashState,
+    int initReservePrefixLenState, int initReserveSuffixLenState,
+    byte[32] initReserveTemplateHashState,
+    int kccPrefixLen, int kccSuffixLen, byte[32] kccTemplateHash,
+    int accountPrefixLen, int accountSuffixLen, byte[32] accountTemplateHash,
+    int governancePrefixLen, int governanceSuffixLen,
+    byte[32] governanceTemplateHash,
+    int proposalPrefixLen, int proposalSuffixLen,
+    byte[32] proposalTemplateHash
+) {
+    byte[32] assetId = initAssetId;
+    byte[32] reserveId = initReserveId;
+    byte[32] governanceId = initGovernanceId;
+    bool enabled = initEnabled;
+    int seriesNonce = initSeriesNonce;
+    int accountNonce = initAccountNonce;
+    int totalSaved = initTotalSaved;
+    int currentRatePpm = initCurrentRatePpm;
+    int interestDelayDaa = initInterestDelayDaa;
+    int maxAccrualDaa = initMaxAccrualDaa;
+    int daaPerYear = initDaaPerYear;
+    int accountValueSompi = initAccountValueSompi;
+    int controllerPrefixLenState = initControllerPrefixLenState;
+    int controllerSuffixLenState = initControllerSuffixLenState;
+    byte[32] controllerTemplateHashState = initControllerTemplateHashState;
+    int reservePrefixLenState = initReservePrefixLenState;
+    int reserveSuffixLenState = initReserveSuffixLenState;
+    byte[32] reserveTemplateHashState = initReserveTemplateHashState;
+
+    struct TokenState {
+        byte[32] ownerIdentifier; byte identifierType; int amount; bool isMinter;
+    }
+    struct AccountState {
+        pubkey owner; byte[32] controllerId; byte[32] reserveId; byte[32] assetId;
+        int saved; int ratePpm; int delayRemainingDaa; int remainingAccrualDaa;
+        int daaPerYear; pubkey referrer; int referralFeePpm;
+        int controllerPrefixLen; int controllerSuffixLen; byte[32] controllerTemplateHash;
+        int reservePrefixLen; int reserveSuffixLen; byte[32] reserveTemplateHash;
+    }
+    struct GovernanceState {
+        byte[32] assetId; byte[32] kpsId; byte[32] reserveId; byte[32] controllerId;
+        int proposalNonce; int executionNonce; byte[32] activeProposalId;
+        int votingDelayDaa; int executionWindowDaa;
+        int vetoThresholdPpm; int proposalDepositSompi;
+        int reservePrefixLenState; int reserveSuffixLenState;
+        byte[32] reserveTemplateHashState;
+    }
+    struct ProposalState {
+        pubkey proposer; byte[32] governanceId; byte[32] controllerId;
+        byte[32] assetId; int proposalNonce; bool activated; int ratePpm;
+        int interestDelayDaa; int maxAccrualDaa; int daaPerYear;
+        int votingDelayDaa; int executionWindowDaa; int depositSompi;
+    }
+    byte constant IDENTIFIER_PUBKEY = 0x00;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    int constant PPM = 1000000;
+    int constant MAX_AMOUNT = 36028797018963967;
+    int constant MAX_REFERRAL_PPM = 250000;
+    byte[32] constant ZERO = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+    #[covenant.singleton(name = initialize_governance)]
+    function initializeGovernancePolicy(State prevState, State nextState, sig ownerSig) {
+        require(prevState.governanceId == ZERO && nextState.governanceId != ZERO);
+        require(nextState.assetId == prevState.assetId && nextState.reserveId == prevState.reserveId);
+        require(nextState.enabled == prevState.enabled && !prevState.enabled);
+        require(nextState.seriesNonce == prevState.seriesNonce);
+        require(nextState.accountNonce == prevState.accountNonce);
+        require(nextState.totalSaved == prevState.totalSaved);
+        require(nextState.currentRatePpm == prevState.currentRatePpm);
+        require(nextState.interestDelayDaa == prevState.interestDelayDaa);
+        require(nextState.maxAccrualDaa == prevState.maxAccrualDaa);
+        require(nextState.daaPerYear == prevState.daaPerYear);
+        require(nextState.accountValueSompi == prevState.accountValueSompi);
+        require(nextState.controllerPrefixLenState == prevState.controllerPrefixLenState);
+        require(nextState.controllerSuffixLenState == prevState.controllerSuffixLenState);
+        require(nextState.controllerTemplateHashState == prevState.controllerTemplateHashState);
+        require(nextState.reservePrefixLenState == prevState.reservePrefixLenState);
+        require(nextState.reserveSuffixLenState == prevState.reserveSuffixLenState);
+        require(nextState.reserveTemplateHashState == prevState.reserveTemplateHashState);
+        require(checkSig(ownerSig, bootstrapOwner));
+        byte[32] controllerId = OpInputCovenantId(this.activeInputIndex);
+        int successor = OpCovOutputIdx(controllerId, 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    function requireIdentity(State a, State b) {
+        require(b.assetId == a.assetId && b.reserveId == a.reserveId);
+        require(b.governanceId == a.governanceId && b.daaPerYear == a.daaPerYear);
+        require(b.accountValueSompi == a.accountValueSompi);
+        require(b.controllerPrefixLenState == a.controllerPrefixLenState);
+        require(b.controllerSuffixLenState == a.controllerSuffixLenState);
+        require(b.controllerTemplateHashState == a.controllerTemplateHashState);
+        require(b.reservePrefixLenState == a.reservePrefixLenState);
+        require(b.reserveSuffixLenState == a.reserveSuffixLenState);
+        require(b.reserveTemplateHashState == a.reserveTemplateHashState);
+    }
+
+    function requireToken(TokenState s, byte[32] tokenOwner, byte kind, int amount) {
+        require(s.ownerIdentifier == tokenOwner && s.identifierType == kind);
+        require(s.amount == amount && !s.isMinter);
+    }
+
+    #[covenant.singleton(name = execute_series)]
+    function executeSeriesPolicy(
+        State prevState, State nextState,
+        byte governanceInputIndex, byte proposalInputIndex
+    ) {
+        requireIdentity(prevState, nextState);
+        int governanceIdx = unsigned(governanceInputIndex);
+        int proposalIdx = unsigned(proposalInputIndex);
+        require(governanceIdx < tx.inputs.length && proposalIdx < tx.inputs.length);
+        require(OpInputCovenantId(governanceIdx) == prevState.governanceId);
+        GovernanceState governance = readInputStateWithTemplate(governanceIdx,
+            governancePrefixLen, governanceSuffixLen, governanceTemplateHash);
+        ProposalState proposal = readInputStateWithTemplate(proposalIdx,
+            proposalPrefixLen, proposalSuffixLen, proposalTemplateHash);
+        byte[32] proposalId = OpInputCovenantId(proposalIdx);
+        require(governance.assetId == prevState.assetId);
+        require(governance.reserveId == prevState.reserveId);
+        require(governance.controllerId == OpInputCovenantId(this.activeInputIndex));
+        require(governance.activeProposalId == proposalId);
+        require(proposal.governanceId == prevState.governanceId);
+        require(proposal.controllerId == OpInputCovenantId(this.activeInputIndex));
+        require(proposal.assetId == prevState.assetId && proposal.activated);
+        require(proposal.proposalNonce == governance.proposalNonce);
+        require(proposal.votingDelayDaa == governance.votingDelayDaa);
+        require(proposal.executionWindowDaa == governance.executionWindowDaa);
+        require(proposal.depositSompi == governance.proposalDepositSompi);
+        require(proposal.ratePpm >= 0 && proposal.ratePpm <= PPM);
+        require(proposal.interestDelayDaa > 0 && proposal.interestDelayDaa <= MAX_AMOUNT);
+        require(proposal.maxAccrualDaa > 0 && proposal.maxAccrualDaa <= MAX_AMOUNT);
+        require(proposal.daaPerYear == prevState.daaPerYear);
+        require(nextState.enabled == (proposal.ratePpm > 0));
+        require(nextState.seriesNonce == prevState.seriesNonce + 1);
+        require(nextState.accountNonce == prevState.accountNonce);
+        require(nextState.totalSaved == prevState.totalSaved);
+        require(nextState.currentRatePpm == proposal.ratePpm);
+        require(nextState.interestDelayDaa == proposal.interestDelayDaa);
+        require(nextState.maxAccrualDaa == proposal.maxAccrualDaa);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = open_account)]
+    function openAccountPolicy(
+        State prevState, State nextState, byte accountOutputIndex,
+        byte[] accountPrefix, byte[] accountSuffix,
+        AccountState account, pubkey depositor, int amount,
+        TokenState accountToken
+    ) {
+        requireIdentity(prevState, nextState);
+        require(prevState.enabled && prevState.currentRatePpm > 0);
+        require(amount > 0 && amount <= MAX_AMOUNT);
+        require(prevState.totalSaved <= MAX_AMOUNT - amount);
+        require(nextState.enabled == prevState.enabled);
+        require(nextState.seriesNonce == prevState.seriesNonce);
+        require(nextState.accountNonce == prevState.accountNonce + 1);
+        require(nextState.totalSaved == prevState.totalSaved + amount);
+        require(nextState.currentRatePpm == prevState.currentRatePpm);
+        require(nextState.interestDelayDaa == prevState.interestDelayDaa);
+        require(nextState.maxAccrualDaa == prevState.maxAccrualDaa);
+
+        int accountIdx = unsigned(accountOutputIndex);
+        require(accountIdx < tx.outputs.length);
+        byte[32] controllerId = OpInputCovenantId(this.activeInputIndex);
+        require(account.owner == depositor && account.controllerId == controllerId);
+        require(account.reserveId == prevState.reserveId && account.assetId == prevState.assetId);
+        require(account.saved == amount && account.ratePpm == prevState.currentRatePpm);
+        require(account.delayRemainingDaa == prevState.interestDelayDaa);
+        require(account.remainingAccrualDaa == prevState.maxAccrualDaa);
+        require(account.daaPerYear == prevState.daaPerYear);
+        require(account.referralFeePpm >= 0 && account.referralFeePpm <= MAX_REFERRAL_PPM);
+        require(account.controllerPrefixLen == prevState.controllerPrefixLenState);
+        require(account.controllerSuffixLen == prevState.controllerSuffixLenState);
+        require(account.controllerTemplateHash == prevState.controllerTemplateHashState);
+        require(account.reservePrefixLen == prevState.reservePrefixLenState);
+        require(account.reserveSuffixLen == prevState.reserveSuffixLenState);
+        require(account.reserveTemplateHash == prevState.reserveTemplateHashState);
+        require(templateHash(accountPrefix, accountSuffix) == accountTemplateHash);
+        validateOutputStateWithTemplate(accountIdx, account, accountPrefix,
+            accountSuffix, accountTemplateHash);
+        byte[32] accountId = OpOutputCovenantId(accountIdx);
+        require(tx.outputs[accountIdx].value == prevState.accountValueSompi);
+
+        require(OpCovInputCount(prevState.assetId) == 1);
+        require(OpCovOutputCount(prevState.assetId) == 1);
+        int depositIdx = OpCovInputIdx(prevState.assetId, 0);
+        TokenState deposit = readInputStateWithTemplate(depositIdx,
+            kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        requireToken(deposit, byte[32](depositor), IDENTIFIER_PUBKEY, amount);
+        requireToken(accountToken, accountId, IDENTIFIER_COVENANT_ID, amount);
+        validateOutputStateWithInputTemplate(OpCovOutputIdx(prevState.assetId, 0),
+            accountToken, depositIdx, kccPrefixLen, kccSuffixLen, kccTemplateHash);
+        int successor = OpCovOutputIdx(controllerId, 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = account_refresh)]
+    function accountRefreshPolicy(
+        State prevState, State nextState, byte accountInputIndex,
+        AccountState nextAccount
+    ) {
+        requireIdentity(prevState, nextState);
+        require(nextState.enabled == prevState.enabled);
+        require(nextState.seriesNonce == prevState.seriesNonce);
+        require(nextState.accountNonce == prevState.accountNonce);
+        require(nextState.currentRatePpm == prevState.currentRatePpm);
+        require(nextState.interestDelayDaa == prevState.interestDelayDaa);
+        require(nextState.maxAccrualDaa == prevState.maxAccrualDaa);
+        int idx = unsigned(accountInputIndex);
+        require(idx < tx.inputs.length);
+        AccountState old = readInputStateWithTemplate(idx,
+            accountPrefixLen, accountSuffixLen, accountTemplateHash);
+        require(old.controllerId == OpInputCovenantId(this.activeInputIndex));
+        require(old.assetId == prevState.assetId && old.reserveId == prevState.reserveId);
+        require(nextAccount.owner == old.owner && nextAccount.controllerId == old.controllerId);
+        require(nextAccount.assetId == old.assetId && nextAccount.reserveId == old.reserveId);
+        require(nextAccount.ratePpm == old.ratePpm && nextAccount.daaPerYear == old.daaPerYear);
+        require(nextAccount.referrer == old.referrer);
+        require(nextAccount.referralFeePpm == old.referralFeePpm);
+        require(nextAccount.saved > old.saved);
+        require(nextState.totalSaved == prevState.totalSaved + (nextAccount.saved - old.saved));
+        int accountOut = OpCovOutputIdx(OpInputCovenantId(idx), 0);
+        validateOutputStateWithInputTemplate(accountOut, nextAccount, idx,
+            accountPrefixLen, accountSuffixLen, accountTemplateHash);
+        require(tx.outputs[accountOut].value == tx.inputs[idx].value);
+        require(OpCovInputCount(prevState.reserveId) == 1);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant.singleton(name = account_close)]
+    function accountClosePolicy(
+        State prevState, State nextState, byte accountInputIndex
+    ) {
+        requireIdentity(prevState, nextState);
+        require(nextState.enabled == prevState.enabled);
+        require(nextState.seriesNonce == prevState.seriesNonce);
+        require(nextState.accountNonce == prevState.accountNonce);
+        require(nextState.currentRatePpm == prevState.currentRatePpm);
+        require(nextState.interestDelayDaa == prevState.interestDelayDaa);
+        require(nextState.maxAccrualDaa == prevState.maxAccrualDaa);
+        int idx = unsigned(accountInputIndex);
+        require(idx < tx.inputs.length);
+        AccountState old = readInputStateWithTemplate(idx,
+            accountPrefixLen, accountSuffixLen, accountTemplateHash);
+        require(old.controllerId == OpInputCovenantId(this.activeInputIndex));
+        require(old.assetId == prevState.assetId && old.reserveId == prevState.reserveId);
+        require(old.saved > 0 && prevState.totalSaved >= old.saved);
+        require(nextState.totalSaved == prevState.totalSaved - old.saved);
+        require(OpCovOutputCount(OpInputCovenantId(idx)) == 0);
+        int successor = OpCovOutputIdx(OpInputCovenantId(this.activeInputIndex), 0);
+        require(tx.outputs[successor].value == tx.inputs[this.activeInputIndex].value);
+    }
+}
